@@ -13,7 +13,7 @@
 
 import https from 'https';
 
-const WEBHOOK_URL = 'https://discord.com/api/webhooks/REDACTED_WEBHOOK_ID/REDACTED_WEBHOOK_TOKEN';
+const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL ?? '';
 
 export async function discordNotify(content) {
   return new Promise((resolve) => {
