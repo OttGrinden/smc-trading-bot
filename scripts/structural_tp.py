@@ -254,6 +254,123 @@ def calc_structural_tp(
     }
 
 
+def calc_structural_tp2(
+    candles_daily: Optional[list],
+    candles_4h:    Optional[list],
+    tp1_price:     float,
+    entry_price:   float,
+    direction:     str,
+    liq_sym:       Optional[dict],
+    sl_pct:        float = 3.3,
+) -> dict:
+    """
+    Gibt den naechsten strukturellen TP2-Level zurueck — der naechste strukturelle
+    Level JENSEITS von TP1.
+
+    Identische Logik wie calc_structural_tp, aber mit tp1_price als neuem
+    'Entry Floor/Ceiling': Kandidaten muessen jenseits von TP1 liegen.
+
+    Fallback: tp2_available=False wenn kein Level gefunden.
+    """
+    # Mindestbewegung jenseits TP1: mindestens 1.5x SL-Distanz vom Entry
+    # (wiederverwendet fuer Sanity) + muss jenseits TP1 liegen
+    min_move  = entry_price * (sl_pct / 100) * MIN_RR
+    max_move  = entry_price * (MAX_TP_PCT / 100)
+    candidates: list[tuple[float, str]] = []
+
+    # 1. Swing-Pivots jenseits TP1 (Daily bevorzugt, dann 4H fuer weiteren Level)
+    for candles, tf, pl in [
+        (candles_daily, 'daily', PIVOT_LEN_D),
+        (candles_4h,    '4H',    PIVOT_LEN_4H),
+    ]:
+        if not candles:
+            continue
+        highs, lows = find_pivots(candles, pl)
+
+        if direction == 'long':
+            # Naechster Swing-HIGH ueber TP1 (aber innerhalb MAX_TP_PCT vom Entry)
+            above = [(p, f'swing_high_{tf}')
+                     for _, p in highs
+                     if p > tp1_price
+                     and p < entry_price + max_move]
+            if above:
+                candidates.append(min(above, key=lambda x: x[0]))
+        else:
+            # Naechster Swing-LOW unter TP1 (aber innerhalb MAX_TP_PCT vom Entry)
+            below = [(p, f'swing_low_{tf}')
+                     for _, p in lows
+                     if p < tp1_price
+                     and p > entry_price - max_move]
+            if below:
+                candidates.append(max(below, key=lambda x: x[0]))
+
+    # 2. 0.618-Fib-Extension — jenseits TP1
+    for candles, tf, pl in [
+        (candles_daily, 'daily', PIVOT_LEN_D),
+        (candles_4h,    '4H',    PIVOT_LEN_4H),
+    ]:
+        if not candles:
+            continue
+        highs, lows = find_pivots(candles, pl)
+        bos = find_bos_for_direction(candles, highs, lows, direction)
+        if bos is None:
+            continue
+        idm = find_idm_price(candles, bos, highs, lows)
+        h1  = bos['h1_price']
+        leg = abs(h1 - idm)
+        if leg < entry_price * 0.005:
+            continue
+
+        if direction == 'long':
+            ext = h1 + 0.618 * leg
+            if tp1_price < ext < entry_price + max_move:
+                candidates.append((ext, f'fib_618_ext_{tf}'))
+        else:
+            ext = h1 - 0.618 * leg
+            if entry_price - max_move < ext < tp1_price:
+                candidates.append((ext, f'fib_618_ext_{tf}'))
+
+    # 3. Liq-Wall jenseits TP1
+    if liq_sym:
+        if direction == 'long':
+            walls = liq_sym.get('sell_walls', [])
+            above = [(w['price'], 'liq_sell_wall')
+                     for w in walls
+                     if w.get('price', 0) > tp1_price
+                     and w.get('price', 0) < entry_price + max_move]
+            if above:
+                candidates.append(min(above, key=lambda x: x[0]))
+        else:
+            walls = liq_sym.get('buy_walls', [])
+            below = [(w['price'], 'liq_buy_wall')
+                     for w in walls
+                     if 0 < w.get('price', 0) < tp1_price
+                     and w.get('price', 0) > entry_price - max_move]
+            if below:
+                candidates.append(max(below, key=lambda x: x[0]))
+
+    if not candidates:
+        return {'tp2_available': False, 'tp2_price_usd': None,
+                'tp2_pct': None, 'tp2_rr': None, 'tp2_source': None}
+
+    # Naehesten Kandidaten jenseits TP1 waehlen
+    if direction == 'long':
+        tp2_price, tp2_source = min(candidates, key=lambda x: x[0])
+    else:
+        tp2_price, tp2_source = max(candidates, key=lambda x: x[0])
+
+    tp2_pct = abs(tp2_price - entry_price) / entry_price * 100
+    tp2_rr  = tp2_pct / sl_pct if sl_pct > 0 else 0
+
+    return {
+        'tp2_available':    True,
+        'tp2_price_usd':    round(tp2_price, 6),
+        'tp2_pct':          round(tp2_pct, 2),
+        'tp2_rr':           round(tp2_rr, 2),
+        'tp2_source':       tp2_source,
+    }
+
+
 # -- Main ---------------------------------------------------------------------
 
 def parse_args(argv: list) -> dict:
@@ -309,6 +426,28 @@ def main() -> None:
     )
     result['symbol'] = symbol
     result['side']   = side
+
+    # TP2: only attempt when TP1 was found
+    if result.get('available'):
+        tp2 = calc_structural_tp2(
+            candles_daily=candles_daily,
+            candles_4h=candles_4h,
+            tp1_price=result['tp_price_usd'],
+            entry_price=entry_price,
+            direction=side,
+            liq_sym=liq_sym,
+            sl_pct=sl_pct,
+        )
+        result.update(tp2)
+    else:
+        result.update({
+            'tp2_available': False,
+            'tp2_price_usd': None,
+            'tp2_pct':       None,
+            'tp2_rr':        None,
+            'tp2_source':    None,
+        })
+
     print(json.dumps(result))
     sys.exit(0)
 

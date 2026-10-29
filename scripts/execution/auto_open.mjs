@@ -183,6 +183,11 @@ const takeProfitPct = structTp
 const tpSource = structTp
   ? structTp.source
   : 'fixed_score';
+
+// Partial TP: use structural levels when available; fallback keeps single-TP behavior.
+const tp1Pct = takeProfitPct;
+const tp2Pct = structTp?.tp2_available ? +structTp.tp2_pct.toFixed(2) : null;
+const hasPartialTp = tp2Pct != null;
 const trailingStopDistancePct  = scoreParams.trailing_stop_distance_pct ?? null;
 const thesisValidUntil         = score === 8
   ? new Date(Date.now() + 5 * 24 * 3_600_000).toISOString()
@@ -255,6 +260,18 @@ if (dryRun) {
     take_profit_pct:       takeProfitPct,
     tp_source:             tpSource,
     ...(structTp ? { tp_price_usd: structTp.tp_price_usd, tp_rr: structTp.rr } : {}),
+    ...(hasPartialTp ? {
+      tp1_pct:          tp1Pct,
+      tp2_pct:          tp2Pct,
+      tp1_price_usd:    structTp.tp_price_usd,
+      tp2_price_usd:    structTp.tp2_price_usd,
+      tp1_quantity_pct: 0.5,
+      tp2_quantity_pct: 0.5,
+      tp1_hit:          false,
+      tp2_hit:          false,
+      tp1_source:       structTp.source,
+      tp2_source:       structTp.tp2_source,
+    } : {}),
     breakeven_trigger_pct: breakevenTriggerPct,
     state_after: {
       equity_nav:           nav,
@@ -337,6 +354,18 @@ state.open_positions.push({
   ...(takeProfitPct != null ? { take_profit_pct: takeProfitPct } : {}),
   tp_source:          tpSource,
   ...(structTp ? { tp_price_usd: structTp.tp_price_usd, tp_rr: structTp.rr } : {}),
+  ...(hasPartialTp ? {
+    tp1_pct:          tp1Pct,
+    tp2_pct:          tp2Pct,
+    tp1_price_usd:    structTp.tp_price_usd,
+    tp2_price_usd:    structTp.tp2_price_usd,
+    tp1_quantity_pct: 0.5,
+    tp2_quantity_pct: 0.5,
+    tp1_hit:          false,
+    tp2_hit:          false,
+    tp1_source:       structTp.source,
+    tp2_source:       structTp.tp2_source,
+  } : {}),
   ...(breakevenTriggerPct != null ? { breakeven_trigger_pct: breakevenTriggerPct, peak_pnl_pct: 0, breakeven_activated: false } : {}),
   ...(trailingStopDistancePct != null ? { trailing_stop_distance_pct: trailingStopDistancePct } : {}),
   ...(thesisValidUntil != null ? { thesis_valid_until: thesisValidUntil, thesis_status: 'active' } : {}),
@@ -390,6 +419,18 @@ process.stdout.write(JSON.stringify({
   take_profit_pct: takeProfitPct,
   tp_source:       tpSource,
   ...(structTp ? { tp_price_usd: structTp.tp_price_usd, tp_rr: structTp.rr } : {}),
+  ...(hasPartialTp ? {
+    tp1_pct:          tp1Pct,
+    tp2_pct:          tp2Pct,
+    tp1_price_usd:    structTp.tp_price_usd,
+    tp2_price_usd:    structTp.tp2_price_usd,
+    tp1_quantity_pct: 0.5,
+    tp2_quantity_pct: 0.5,
+    tp1_hit:          false,
+    tp2_hit:          false,
+    tp1_source:       structTp.source,
+    tp2_source:       structTp.tp2_source,
+  } : {}),
   order_id:        order.order_id,
   run_id:          runId,
   portfolio: {

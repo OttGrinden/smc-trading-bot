@@ -28,7 +28,7 @@
  */
 
 import { readFileSync, readdirSync } from 'fs';
-import { dirname, join, resolve } from 'path';
+import { join, dirname }             from 'path';
 import { fileURLToPath }             from 'url';
 
 import {
@@ -43,10 +43,8 @@ import { EXECUTION_MODES, ORDER_STATES } from '../schemas.mjs';
 import { PaperBroker }           from '../paper_broker.mjs';
 import { realismEnabled }        from '../realism_config.mjs';
 import { alertSlProximity, alertTakeProfitHit, alertBreakevenActivated, alertBreakevenHit } from '../../notify.mjs';
-const _d = dirname(fileURLToPath(import.meta.url));
-const TRADING_DIR = resolve(_d, '..', '..', '..', 'trading');
 
-const LOGS_DIR = join(TRADING_DIR, 'logs');
+const LOGS_DIR = 'C:\\Users\\rapha\\.claude\\trading\\logs';
 
 // Read the most recent btc_mark_price_usd from portfolio history for benchmark delta.
 function readLastBtcMarkPrice() {
@@ -692,7 +690,139 @@ export function runPortfolio(runOutput, decisions, opts = {}) {
       }
     }
 
+    // Partial TP1/TP2 (opt-in — only when pos.tp1_pct is set; fail-soft: any error falls back to single-TP)
+    // TP1: close 50% of position, move SL to breakeven.
+    // TP2: close remaining 50% (only after tp1_hit=true).
+    // Positions without tp1_pct use the existing single take_profit_pct path below.
+    let partialTpHandled = false;
+    if (pos.tp1_pct != null) {
+      try {
+        const pnlPct = dirFactor(pos.side) * ((pos.mark_price_eur - pos.entry_price_eur) / pos.entry_price_eur) * 100;
+
+        // ── TP2 check (only after TP1 already hit) ────────────────────────────
+        if (pos.tp1_hit === true && pos.tp2_hit !== true && pos.tp2_pct != null) {
+          if (pnlPct >= pos.tp2_pct) {
+            // Close remaining quantity (tp2_quantity_pct fraction of original; pos.quantity is already the remainder)
+            const r = executeExit(broker, state, pos, curUsd, 'partial_tp2_hit', runId, orderStats, realismCfg);
+            if (r) {
+              pos.tp2_hit = true;
+              closed.push({ symbol: pos.symbol, side: pos.side, pnl_pct: +pnlPct.toFixed(2), tp_level: 'tp2', ...r });
+              auditLog('partial_tp2_hit', {
+                symbol: pos.symbol, side: pos.side, pnl_pct: +pnlPct.toFixed(2),
+                tp2_pct: pos.tp2_pct, mark_usd: curUsd, run_id: runId,
+              });
+              process.stderr.write(JSON.stringify({
+                info:    'partial_tp2_hit',
+                symbol:  pos.symbol, side: pos.side,
+                pnl_pct: +pnlPct.toFixed(2), tp2_pct: pos.tp2_pct, mark_usd: curUsd,
+              }) + '\n');
+              alertTakeProfitHit({ symbol: pos.symbol, side: pos.side, pnlPct: +pnlPct.toFixed(2), tpPct: pos.tp2_pct });
+            } else {
+              survivors.push(pos);
+            }
+            partialTpHandled = true;
+          }
+        }
+
+        // ── TP1 check (fires first; tp2 check above will not run in same iteration) ──
+        if (!partialTpHandled && pos.tp1_hit !== true) {
+          if (pnlPct >= pos.tp1_pct) {
+            // Close tp1_quantity_pct (50%) of position via partial close helper
+            const closeQtyFraction = pos.tp1_quantity_pct ?? 0.5;
+            const partialQty       = +(pos.quantity * closeQtyFraction).toFixed(8);
+            const remainQty        = +(pos.quantity - partialQty).toFixed(8);
+
+            // Build a synthetic intent+decision for this partial exit
+            const { intent: pi, decision: pd } = buildExitIntentDecision(pos, curUsd, 'partial_tp1_hit', runId);
+            const partialOrder = broker.placeOrder(pi, pd, {
+              action:       'close',
+              order_action: orderAction('close', pos.side),
+              quantity:     partialQty,
+              close_reason: 'partial_tp1_hit',
+              run_id:       runId,
+            });
+            orderStats.created += 1;
+            const filledPartial = broker.fillOrder(partialOrder, curUsd, { reason: 'partial_tp1_hit', quantity: partialQty }, realismCfg);
+
+            if (filledPartial.state === ORDER_STATES.FILLED) {
+              orderStats.filled += 1;
+              if (filledPartial.fee_eur > 0) orderStats.fees_eur_this_run = +((orderStats.fees_eur_this_run ?? 0) + filledPartial.fee_eur).toFixed(6);
+
+              const closeEur       = usdToEur(filledPartial.filled_price_usd);
+              const grossRealized  = dirFactor(pos.side) * partialQty * (closeEur - pos.entry_price_eur);
+              const feeEur         = filledPartial.fee_eur ?? 0;
+              const realized       = +(grossRealized - feeEur).toFixed(4);
+
+              state.realized_pnl        = +(state.realized_pnl + realized).toFixed(4);
+              state.cumulative_fees_eur = +((state.cumulative_fees_eur ?? 0) + feeEur).toFixed(6);
+              state.closed_positions_summary.count += 1;
+              state.closed_positions_summary.realized_pnl_total = +(state.closed_positions_summary.realized_pnl_total + realized).toFixed(4);
+              if (realized >= 0) state.closed_positions_summary.wins += 1;
+              else                state.closed_positions_summary.losses += 1;
+
+              appendLedger({
+                ts:                 new Date().toISOString(),
+                event:              'partial_close',
+                run_id:             runId,
+                order_id:           filledPartial.order_id,
+                symbol:             pos.symbol,
+                side:               pos.side,
+                quantity:           partialQty,
+                entry_price_eur:    pos.entry_price_eur,
+                close_price_eur:    +closeEur.toFixed(6),
+                gross_realized_eur: +grossRealized.toFixed(4),
+                fee_eur:            +feeEur.toFixed(6),
+                realized_pnl_eur:   realized,
+                reason:             'partial_tp1_hit',
+                tp_level:           'tp1',
+                entry_run_id:       pos.entry_run_id,
+              });
+              auditLog('partial_tp1_hit', {
+                symbol: pos.symbol, side: pos.side, pnl_pct: +pnlPct.toFixed(2),
+                tp1_pct: pos.tp1_pct, closed_qty: partialQty, remain_qty: remainQty,
+                mark_usd: curUsd, run_id: runId,
+              });
+
+              // Mutate position: reduce quantity, move SL to breakeven
+              pos.quantity     = remainQty;
+              pos.notional_eur = +(remainQty * pos.entry_price_eur).toFixed(4);
+              pos.tp1_hit      = true;
+
+              // Move SL to breakeven (entry price)
+              pos.stop_loss_pct       = 0;    // 0% from entry = breakeven
+              pos.stop_loss_price_eur = pos.entry_price_eur;
+
+              process.stderr.write(JSON.stringify({
+                info:        'partial_tp1_hit',
+                symbol:      pos.symbol, side: pos.side,
+                pnl_pct:     +pnlPct.toFixed(2), tp1_pct: pos.tp1_pct,
+                closed_qty:  partialQty, remain_qty: remainQty,
+                sl_moved_to: 'breakeven', mark_usd: curUsd,
+              }) + '\n');
+              alertTakeProfitHit({ symbol: pos.symbol, side: pos.side, pnlPct: +pnlPct.toFixed(2), tpPct: pos.tp1_pct });
+
+              // Position survives with reduced quantity; NOT closed
+              survivors.push(pos);
+              partialTpHandled = true;
+            } else {
+              orderStats.rejected += 1;
+              // Partial order rejected — fall through to normal single-TP path
+            }
+          }
+        }
+      } catch (partialTpErr) {
+        // Fail-soft: log error and fall through to single-TP path
+        process.stderr.write(JSON.stringify({
+          warn:   'partial_tp_logic_error',
+          symbol: pos.symbol, side: pos.side,
+          detail: String(partialTpErr?.message ?? partialTpErr),
+        }) + '\n');
+      }
+    }
+    if (partialTpHandled) continue;
+
     // Take-profit (opt-in — only fires when pos.take_profit_pct is set)
+    // Also acts as fallback for positions where partial TP failed (fail-soft).
     if (pos.take_profit_pct != null && pos.take_profit_pct > 0) {
       const pnlPct = dirFactor(pos.side) * ((pos.mark_price_eur - pos.entry_price_eur) / pos.entry_price_eur) * 100;
       if (pnlPct >= pos.take_profit_pct) {
@@ -1074,8 +1204,8 @@ export function runPortfolio(runOutput, decisions, opts = {}) {
     state_file:          PORTFOLIO_PATHS.state,
     history_file:        PORTFOLIO_PATHS.history,
     ledger_file:         PORTFOLIO_PATHS.ledger,
-    orders_dir:          join(TRADING_DIR, 'execution', 'orders'),
-    order_events_file:   join(TRADING_DIR, 'execution', 'orders', 'order_events.jsonl'),
+    orders_dir:          'C:\\Users\\rapha\\.claude\\trading\\execution\\orders',
+    order_events_file:   'C:\\Users\\rapha\\.claude\\trading\\execution\\orders\\order_events.jsonl',
   };
 }
 

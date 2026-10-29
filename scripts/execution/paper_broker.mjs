@@ -25,18 +25,15 @@
  */
 
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync, appendFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { join }                from 'path';
 import { makePaperOrder, ORDER_STATES }          from './schemas.mjs';
 import { transition }                            from './order_state.mjs';
 import { auditLog }                              from './audit_log.mjs';
 import { realismEnabled }                        from './realism_config.mjs';
 import { buildFillDetails }                      from './fill_model.mjs';
 import { EUR_USD_RATE }                          from './portfolio/portfolio_state.mjs';
-import { fileURLToPath } from 'url';
-const _d = dirname(fileURLToPath(import.meta.url));
-const TRADING_DIR = resolve(_d, '..', '..', 'trading');
 
-const ORDERS_DIR        = join(TRADING_DIR, 'execution', 'orders');
+const ORDERS_DIR        = 'C:\\Users\\rapha\\.claude\\trading\\execution\\orders';
 const ORDER_EVENTS_LOG  = join(ORDERS_DIR, 'order_events.jsonl');
 
 // Stub account — replace with real account object when live
@@ -430,5 +427,68 @@ export class PaperBroker {
    */
   getOrder(orderId) {
     return loadOrder(orderId);
+  }
+
+  /**
+   * partialClose — compute PnL for a fractional close of a position.
+   *
+   * Does NOT write to portfolio state (portfolio_engine.mjs handles that).
+   * Does NOT transition any order (caller uses placeOrder+fillOrder for the actual fill).
+   * This is a pure calculation helper used for observability and ledger preparation.
+   *
+   * @param {object} position             — open position object (from portfolio_state)
+   * @param {number} closeQuantityFraction — fraction of position.quantity to close (0 < x <= 1)
+   * @param {number} markPriceUsd         — current mark price in USD
+   * @param {string} reason               — 'partial_tp1_hit' | 'partial_tp2_hit' | other
+   * @returns {object}                    — partial-close result (NO state mutation)
+   *   {
+   *     symbol, side, reason,
+   *     close_quantity, remain_quantity,
+   *     entry_price_eur, close_price_usd, close_price_eur,
+   *     gross_realized_eur, realized_pnl_eur,
+   *     notional_closed_eur, notional_remain_eur,
+   *   }
+   */
+  partialClose(position, closeQuantityFraction, markPriceUsd, reason) {
+    if (closeQuantityFraction <= 0 || closeQuantityFraction > 1) {
+      throw new Error(`partialClose: closeQuantityFraction must be in (0, 1], got ${closeQuantityFraction}`);
+    }
+    if (!Number.isFinite(markPriceUsd) || markPriceUsd <= 0) {
+      throw new Error(`partialClose: markPriceUsd must be a positive finite number, got ${markPriceUsd}`);
+    }
+
+    const closePriceEur   = markPriceUsd / EUR_USD_RATE;
+    const closeQty        = +(position.quantity * closeQuantityFraction).toFixed(8);
+    const remainQty       = +(position.quantity - closeQty).toFixed(8);
+    const dirF            = position.side === 'long' ? 1 : -1;
+    const grossRealized   = +(dirF * closeQty * (closePriceEur - position.entry_price_eur)).toFixed(4);
+    const notionalClosed  = +(closeQty   * position.entry_price_eur).toFixed(4);
+    const notionalRemain  = +(remainQty  * position.entry_price_eur).toFixed(4);
+
+    process.stderr.write(JSON.stringify({
+      info:           'paper_broker_partial_close_calc',
+      symbol:         position.symbol,
+      side:           position.side,
+      reason,
+      close_quantity: closeQty,
+      remain_quantity: remainQty,
+      gross_realized_eur: grossRealized,
+      mark_usd:       markPriceUsd,
+    }) + '\n');
+
+    return {
+      symbol:              position.symbol,
+      side:                position.side,
+      reason,
+      close_quantity:      closeQty,
+      remain_quantity:     remainQty,
+      entry_price_eur:     position.entry_price_eur,
+      close_price_usd:     markPriceUsd,
+      close_price_eur:     +closePriceEur.toFixed(6),
+      gross_realized_eur:  grossRealized,
+      realized_pnl_eur:    grossRealized,   // no fee in this helper; caller adds fee if needed
+      notional_closed_eur: notionalClosed,
+      notional_remain_eur: notionalRemain,
+    };
   }
 }
