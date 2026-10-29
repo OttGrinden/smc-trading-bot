@@ -1,0 +1,172 @@
+{
+  "version": "1.2",
+  "description": "Asset universe for trading research system — dynamic crypto + curated stock watchlist by sector",
+  "updated_at": "2026-08-23",
+
+  "pinned_symbols": ["SMCI", "RKLB", "RDW", "LUNR", "ASTS", "SOFI"],
+
+  "stocks": {
+    "sectors": {
+
+      "ai_infrastructure": {
+        "label": "AI Infrastructure",
+        "watchlist": [
+          { "symbol": "NVDA",  "name": "NVIDIA",                "tags": ["AI", "semiconductor", "GPU"] },
+          { "symbol": "AMD",   "name": "Advanced Micro Devices", "tags": ["AI", "semiconductor", "CPU", "GPU"] },
+          { "symbol": "MSFT",  "name": "Microsoft",              "tags": ["AI", "cloud", "OpenAI"] },
+          { "symbol": "META",  "name": "Meta Platforms",         "tags": ["AI", "social", "LLM"] },
+          { "symbol": "GOOGL", "name": "Alphabet",               "tags": ["AI", "cloud", "Gemini"] },
+          { "symbol": "AMZN",  "name": "Amazon",                 "tags": ["AI", "cloud", "AWS"] },
+          { "symbol": "ORCL",  "name": "Oracle",                 "tags": ["AI", "cloud", "database"] },
+          { "symbol": "CRM",   "name": "Salesforce",             "tags": ["AI", "enterprise"] },
+          { "symbol": "NOW",   "name": "ServiceNow",             "tags": ["AI", "enterprise"] },
+          { "symbol": "PLTR",  "name": "Palantir",               "tags": ["AI", "defense", "analytics"] },
+          { "symbol": "NBIS",  "name": "Nebius Group",           "tags": ["AI", "cloud", "GPU"] },
+          { "symbol": "SOUN",  "name": "SoundHound AI",          "tags": ["AI", "voice"] },
+          { "symbol": "BBAI",  "name": "BigBear.ai",             "tags": ["AI", "analytics", "defense"] },
+          { "symbol": "AI",    "name": "C3.ai",                  "tags": ["AI", "enterprise"] },
+          { "symbol": "SNOW",  "name": "Snowflake",              "tags": ["AI", "cloud", "data"] }
+        ]
+      },
+
+      "semiconductor": {
+        "label": "Semiconductor & Chip Manufacturing",
+        "watchlist": [
+          { "symbol": "TSM",  "name": "Taiwan Semiconductor",     "tags": ["semiconductor", "foundry"] },
+          { "symbol": "ASML", "name": "ASML Holding",             "tags": ["semiconductor", "lithography"] },
+          { "symbol": "AVGO", "name": "Broadcom",                 "tags": ["semiconductor", "networking"] },
+          { "symbol": "QCOM", "name": "Qualcomm",                 "tags": ["semiconductor", "mobile"] },
+          { "symbol": "MU",   "name": "Micron Technology",        "tags": ["semiconductor", "memory"] },
+          { "symbol": "SNDK", "name": "Sandisk Corporation",       "tags": ["semiconductor", "storage", "NAND"] },
+          { "symbol": "ARM",  "name": "Arm Holdings",             "tags": ["semiconductor", "CPU", "AI"] },
+          { "symbol": "INTC", "name": "Intel",                    "tags": ["semiconductor", "CPU"] },
+          { "symbol": "SMCI", "name": "Super Micro Computer",     "tags": ["semiconductor", "server", "AI"] },
+          { "symbol": "AMAT", "name": "Applied Materials",        "tags": ["semiconductor", "equipment"] },
+          { "symbol": "LRCX", "name": "Lam Research",             "tags": ["semiconductor", "equipment"] },
+          { "symbol": "KLAC", "name": "KLA Corporation",          "tags": ["semiconductor", "inspection"] },
+          { "symbol": "MRVL", "name": "Marvell Technology",       "tags": ["semiconductor", "networking"] },
+          { "symbol": "ON",   "name": "ON Semiconductor",         "tags": ["semiconductor", "power"] },
+          { "symbol": "WOLF", "name": "Wolfspeed",                "tags": ["semiconductor", "SiC", "power"] },
+          { "symbol": "MPWR", "name": "Monolithic Power Systems", "tags": ["semiconductor", "power"] }
+        ]
+      },
+
+      "energy_infrastructure": {
+        "label": "Energy Infrastructure",
+        "watchlist": [
+          { "symbol": "CEG",  "name": "Constellation Energy",    "tags": ["nuclear", "power", "AI-energy"] },
+          { "symbol": "VST",  "name": "Vistra Corp",             "tags": ["power", "nuclear"] },
+          { "symbol": "ETN",  "name": "Eaton Corp",              "tags": ["power", "grid", "electrical"] },
+          { "symbol": "NEE",  "name": "NextEra Energy",          "tags": ["renewables", "solar", "wind"] },
+          { "symbol": "GEV",  "name": "GE Vernova",              "tags": ["power", "grid", "turbines"] },
+          { "symbol": "PWR",  "name": "Quanta Services",         "tags": ["power", "grid", "infrastructure"] },
+          { "symbol": "ENPH", "name": "Enphase Energy",          "tags": ["solar", "renewables"] },
+          { "symbol": "FSLR", "name": "First Solar",             "tags": ["solar", "renewables"] },
+          { "symbol": "PLUG", "name": "Plug Power",              "tags": ["hydrogen", "fuel-cell"] },
+          { "symbol": "BE",   "name": "Bloom Energy",            "tags": ["fuel-cell", "hydrogen"] },
+          { "symbol": "OKLO", "name": "Oklo",                    "tags": ["nuclear", "SMR"] },
+          { "symbol": "SMR",  "name": "NuScale Power",           "tags": ["nuclear", "SMR"] },
+          { "symbol": "NNE",  "name": "Nano Nuclear Energy",     "tags": ["nuclear", "SMR"] },
+          { "symbol": "AES",  "name": "AES Corporation",         "tags": ["power", "renewables"] },
+          { "symbol": "BKR",  "name": "Baker Hughes",            "tags": ["energy", "services"] }
+        ]
+      },
+
+      "space_defense": {
+        "label": "Space & Defense",
+        "watchlist": [
+          { "symbol": "SPCX", "name": "SpaceX",                  "tags": ["space", "launch", "satellite", "IPO-2026"] },
+          { "symbol": "RKLB", "name": "Rocket Lab",              "tags": ["space", "launch"] },
+          { "symbol": "ASTS", "name": "AST SpaceMobile",         "tags": ["space", "satellite", "telecom"] },
+          { "symbol": "LUNR", "name": "Intuitive Machines",      "tags": ["space", "lunar"] },
+          { "symbol": "LMT",  "name": "Lockheed Martin",         "tags": ["defense", "space"] },
+          { "symbol": "NOC",  "name": "Northrop Grumman",        "tags": ["defense", "space"] },
+          { "symbol": "RTX",  "name": "Raytheon Technologies",   "tags": ["defense", "aerospace"] },
+          { "symbol": "KTOS", "name": "Kratos Defense",          "tags": ["defense", "drone"] },
+          { "symbol": "RDW",  "name": "Redwire",                 "tags": ["space", "manufacturing"] },
+          { "symbol": "JOBY", "name": "Joby Aviation",           "tags": ["air-mobility", "eVTOL"] },
+          { "symbol": "ACHR", "name": "Archer Aviation",         "tags": ["air-mobility", "eVTOL"] },
+          { "symbol": "BWXT", "name": "BWX Technologies",        "tags": ["nuclear", "defense", "space"] },
+          { "symbol": "BA",   "name": "Boeing",                  "tags": ["aerospace", "defense"] },
+          { "symbol": "GD",   "name": "General Dynamics",        "tags": ["defense"] },
+          { "symbol": "HII",  "name": "Huntington Ingalls",      "tags": ["defense", "naval"] }
+        ]
+      },
+
+      "biotech": {
+        "label": "Biotech, Genomics & AI Drug Discovery",
+        "watchlist": [
+          { "symbol": "HIMS", "name": "Hims & Hers Health",      "tags": ["biotech", "telehealth", "GLP-1", "consumer-health"] },
+          { "symbol": "MRNA", "name": "Moderna",                 "tags": ["biotech", "mRNA"] },
+          { "symbol": "BNTX", "name": "BioNTech",                "tags": ["biotech", "mRNA"] },
+          { "symbol": "REGN", "name": "Regeneron",               "tags": ["biotech", "antibody"] },
+          { "symbol": "VRTX", "name": "Vertex Pharmaceuticals",  "tags": ["biotech", "rare-disease"] },
+          { "symbol": "BIIB", "name": "Biogen",                  "tags": ["biotech", "neurology"] },
+          { "symbol": "GILD", "name": "Gilead Sciences",         "tags": ["biotech", "antiviral"] },
+          { "symbol": "AMGN", "name": "Amgen",                   "tags": ["biotech", "biologics"] },
+          { "symbol": "CRSP", "name": "CRISPR Therapeutics",     "tags": ["biotech", "gene-editing"] },
+          { "symbol": "BEAM", "name": "Beam Therapeutics",       "tags": ["biotech", "gene-editing"] },
+          { "symbol": "NTLA", "name": "Intellia Therapeutics",   "tags": ["biotech", "gene-editing"] },
+          { "symbol": "RXRX", "name": "Recursion Pharma",        "tags": ["biotech", "AI", "drug-discovery"] },
+          { "symbol": "SDGR", "name": "Schrödinger",             "tags": ["biotech", "AI", "drug-discovery"] },
+          { "symbol": "ISRG", "name": "Intuitive Surgical",      "tags": ["biotech", "robotics", "surgery"] }
+        ]
+      },
+
+      "robotics": {
+        "label": "Robotics & Automation",
+        "watchlist": [
+          { "symbol": "ISRG", "name": "Intuitive Surgical",      "tags": ["robotics", "surgery", "biotech"] },
+          { "symbol": "PATH", "name": "UiPath",                  "tags": ["robotics", "RPA", "automation"] },
+          { "symbol": "CGNX", "name": "Cognex",                  "tags": ["robotics", "machine-vision"] },
+          { "symbol": "ABBN.SW", "name": "ABB Ltd",              "tags": ["robotics", "automation", "industry"] },
+          { "symbol": "TRMB", "name": "Trimble",                 "tags": ["robotics", "automation"] },
+          { "symbol": "NNDM", "name": "Nano Dimension",          "tags": ["robotics", "3D-printing"] }
+        ]
+      },
+
+      "quantum_computing": {
+        "label": "Quantum Computing",
+        "watchlist": [
+          { "symbol": "IONQ", "name": "IonQ",                    "tags": ["quantum", "computing"] },
+          { "symbol": "RGTI", "name": "Rigetti Computing",        "tags": ["quantum", "computing"] },
+          { "symbol": "QUBT", "name": "Quantum Computing Inc",    "tags": ["quantum", "computing"] },
+          { "symbol": "QBTS", "name": "D-Wave Quantum",          "tags": ["quantum", "computing"] },
+          { "symbol": "ARQQ", "name": "Arqit Quantum",           "tags": ["quantum", "security"] },
+          { "symbol": "IBM",  "name": "IBM",                     "tags": ["quantum", "computing", "AI"] }
+        ]
+      },
+
+      "crypto_adjacent": {
+        "label": "Crypto-Adjacent Stocks",
+        "watchlist": [
+          { "symbol": "COIN", "name": "Coinbase",                "tags": ["crypto", "exchange"] },
+          { "symbol": "MSTR", "name": "MicroStrategy",           "tags": ["crypto", "BTC-proxy"] },
+          { "symbol": "HOOD", "name": "Robinhood",               "tags": ["crypto", "fintech"] },
+          { "symbol": "XYZ",  "name": "Block, Inc.",               "tags": ["crypto", "fintech", "BTC"] },
+          { "symbol": "TSLA", "name": "Tesla",                   "tags": ["crypto", "EV", "AI", "robotics"] },
+          { "symbol": "SOFI", "name": "SoFi Technologies",       "tags": ["crypto", "fintech", "stablecoin"] }
+        ]
+      }
+
+    }
+  },
+
+  "crypto": {
+    "dynamic": true,
+    "filters": {
+      "min_price_usd": 0.000001,
+      "max_high_low_ratio": 25,
+      "require_open_price": true
+    },
+    "notable_altcoins": [
+      "BTC",      "ETH",       "XRP",       "SOL",      "BNB",  "ADA",  "DOT",     "AVAX",  "HBAR",
+      "NEAR",     "APT",       "SUI",       "TIA",      "SEI",  "INJ",
+      "LINK",     "UNI",       "LTC",       "BCH",      "TAO",
+      "DOGE",     "1000SHIB",  "1000PEPE",  "1000FLOKI","WIF",  "1000BONK","BOME",  "BRETT",
+      "1000000MOG","TURBO",    "MEW",       "PNUT",     "SPX",  "POPCAT",  "MOODENG"
+    ],
+    "note": "Full Bitunix Futures universe scanned dynamically. notable_altcoins are always checked regardless of 24h rank. Symbols use Bitunix internal naming (1000PEPE = 1000PEPEUSDT contract)."
+  }
+
+}

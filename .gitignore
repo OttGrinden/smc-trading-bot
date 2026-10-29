@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Environment / credentials — NEVER commit
+.env
+
+# Trading runtime data (generated locally, not in repo)
+trading/cache/
+trading/logs/
+trading/execution/portfolio/
+trading/execution/orders/
+trading/execution/live_orders/
+trading/execution/audit/
+trading/execution/decisions/
+
+# Keep the registry (asset universe definition)
+!trading/registry/
+
+# OS
+.DS_Store
+Thumbs.db
