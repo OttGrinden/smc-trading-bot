@@ -16,9 +16,10 @@
  *   --dry-run                     no writes
  */
 
-import fs   from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import fs                    from 'node:fs';
+import path                  from 'node:path';
+import { spawnSync }         from 'node:child_process';
+import { fileURLToPath }     from 'node:url';
 
 import {
   loadOrInit, save, recompute, appendHistory, appendLedger,
@@ -29,6 +30,31 @@ import { auditLog }    from './audit_log.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CACHE_DIR = path.join(__dirname, '../../trading/cache');
+
+// ─── Structural TP via SMC pivot analysis ────────────────────────────────────
+// Calls structural_tp.py; falls back silently to fixed TP on any failure.
+// Principle: TP of a LONG = nearest Supply Zone (swing high) above entry
+//            TP of a SHORT = nearest Demand Zone (swing low) below entry
+
+function getStructuralTp(sym, side, entryPriceUsd, slPct) {
+  const script = path.join(__dirname, '../structural_tp.py');
+  if (!fs.existsSync(script)) return null;
+  try {
+    const result = spawnSync('python', [
+      script,
+      '--symbol', sym,
+      '--side',   side,
+      '--entry',  String(entryPriceUsd),
+      '--sl-pct', String(slPct),
+    ], { encoding: 'utf8', timeout: 6000 });
+    if (result.status !== 0 || !result.stdout?.trim()) return null;
+    const parsed = JSON.parse(result.stdout.trim());
+    if (!parsed.available) return null;
+    return parsed; // { available, tp_price_usd, tp_pct, rr, source }
+  } catch {
+    return null;
+  }
+}
 
 // ─── Score → execution params (from CLAUDE.md leverage table) ────────────────
 
@@ -146,8 +172,17 @@ const state        = loadOrInit();
 const nav          = state.equity_nav;
 const scoreParams              = SCORE_PARAMS[score];
 const stopLossPct              = scoreParams.sl_pct;
-const takeProfitPct            = scoreParams.take_profit_pct;
 const breakevenTriggerPct      = scoreParams.breakeven_trigger_pct;
+
+// Structural TP: try SMC-based level first, fall back to fixed score TP.
+// Structural TP is only used when R:R >= 1.5 (enforced inside structural_tp.py).
+const structTp = getStructuralTp(symbol, side, priceUsd, stopLossPct);
+const takeProfitPct = structTp
+  ? +structTp.tp_pct.toFixed(2)
+  : scoreParams.take_profit_pct;
+const tpSource = structTp
+  ? structTp.source
+  : 'fixed_score';
 const trailingStopDistancePct  = scoreParams.trailing_stop_distance_pct ?? null;
 const thesisValidUntil         = score === 8
   ? new Date(Date.now() + 5 * 24 * 3_600_000).toISOString()
@@ -218,6 +253,8 @@ if (dryRun) {
       : +(priceUsd * (1 + stopLossPct / 100)).toFixed(4),
     sl_not_before:         slNotBefore,
     take_profit_pct:       takeProfitPct,
+    tp_source:             tpSource,
+    ...(structTp ? { tp_price_usd: structTp.tp_price_usd, tp_rr: structTp.rr } : {}),
     breakeven_trigger_pct: breakevenTriggerPct,
     state_after: {
       equity_nav:           nav,
@@ -298,6 +335,8 @@ state.open_positions.push({
   stop_loss_pct:      stopLossPct,
   ...(slNotBefore != null ? { sl_not_before: slNotBefore } : {}),
   ...(takeProfitPct != null ? { take_profit_pct: takeProfitPct } : {}),
+  tp_source:          tpSource,
+  ...(structTp ? { tp_price_usd: structTp.tp_price_usd, tp_rr: structTp.rr } : {}),
   ...(breakevenTriggerPct != null ? { breakeven_trigger_pct: breakevenTriggerPct, peak_pnl_pct: 0, breakeven_activated: false } : {}),
   ...(trailingStopDistancePct != null ? { trailing_stop_distance_pct: trailingStopDistancePct } : {}),
   ...(thesisValidUntil != null ? { thesis_valid_until: thesisValidUntil, thesis_status: 'active' } : {}),
@@ -349,6 +388,8 @@ process.stdout.write(JSON.stringify({
     : +(priceUsd * (1 + stopLossPct / 100)).toFixed(4),
   sl_not_before:   slNotBefore,
   take_profit_pct: takeProfitPct,
+  tp_source:       tpSource,
+  ...(structTp ? { tp_price_usd: structTp.tp_price_usd, tp_rr: structTp.rr } : {}),
   order_id:        order.order_id,
   run_id:          runId,
   portfolio: {
