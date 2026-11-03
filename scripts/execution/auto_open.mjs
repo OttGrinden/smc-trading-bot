@@ -59,11 +59,11 @@ function getStructuralTp(sym, side, entryPriceUsd, slPct) {
 // ─── Score → execution params (from CLAUDE.md leverage table) ────────────────
 
 const SCORE_PARAMS = {
-  10: { sl_pct: 2.0, notional_pct: 0.05, take_profit_pct: 20, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
-  9:  { sl_pct: 2.5, notional_pct: 0.05, take_profit_pct: 20, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
-  8:  { sl_pct: 3.3, notional_pct: 0.05, take_profit_pct: 18, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
-  7:  { sl_pct: 5.0, notional_pct: 0.03, take_profit_pct: null, breakeven_trigger_pct: null },
-  6:  { sl_pct: 5.0, notional_pct: 0.03, take_profit_pct: null, breakeven_trigger_pct: null },
+  10: { sl_pct: 2.0, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
+  9:  { sl_pct: 2.5, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
+  8:  { sl_pct: 3.3, notional_pct: 0.05, take_profit_pct: 18, early_tp_pct: 7, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
+  7:  { sl_pct: 5.0, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
+  6:  { sl_pct: 5.0, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
 };
 
 // ─── CLI parsing ─────────────────────────────────────────────────────────────
@@ -87,6 +87,7 @@ const reason   = args.reason   ? String(args.reason)               : null;
 const category = args.category ? String(args.category).toLowerCase() : 'stock';
 const sector   = args.sector   ? String(args.sector).toLowerCase() : null;
 const dryRun   = args.dryRun === true || args.dryRun === 'true';
+const tStark   = args.tStark === true || args.tStark === 'true';
 const notionalOverride = args.notionalEur ? parseFloat(args.notionalEur) : null;
 const priceUsdOverride = args.priceUsd   ? parseFloat(args.priceUsd)   : null;
 const runId    = `auto_${new Date().toISOString().slice(0, 16).replace(/[T:]/g, '_')}`;
@@ -174,23 +175,40 @@ const scoreParams              = SCORE_PARAMS[score];
 const stopLossPct              = scoreParams.sl_pct;
 const breakevenTriggerPct      = scoreParams.breakeven_trigger_pct;
 
-// Structural TP: try SMC-based level first, fall back to fixed score TP.
+// Structural TP: try SMC-based level first, fall back to score-based levels.
 // Structural TP is only used when R:R >= 1.5 (enforced inside structural_tp.py).
 const structTp = getStructuralTp(symbol, side, priceUsd, stopLossPct);
-const takeProfitPct = structTp
-  ? +structTp.tp_pct.toFixed(2)
-  : scoreParams.take_profit_pct;
-const tpSource = structTp
-  ? structTp.source
-  : 'fixed_score';
 
-// Partial TP: use structural levels when available; fallback keeps single-TP behavior.
-const tp1Pct = takeProfitPct;
-const tp2Pct = structTp?.tp2_available ? +structTp.tp2_pct.toFixed(2) : null;
-const hasPartialTp = tp2Pct != null;
-const trailingStopDistancePct  = scoreParams.trailing_stop_distance_pct ?? null;
-const thesisValidUntil         = score === 8
-  ? new Date(Date.now() + 5 * 24 * 3_600_000).toISOString()
+// Partial TP: early de-risk (tp1) + full exit (tp2).
+// tp1: structural level OR score-based early de-risk (7% Score-8, 8% Score-9/10)
+// tp2: structural level 2 OR fixed score full TP (18/20%)
+// Always active for Score 8+: closes 50% at tp1, moves SL to BE, lets rest run.
+let tp1Pct, tp2Pct, tpSource, tp1PriceUsd, tp2PriceUsd, tp1Source, tp2Source;
+if (structTp) {
+  tp1Pct      = +structTp.tp_pct.toFixed(2);
+  tp2Pct      = structTp.tp2_available ? +structTp.tp2_pct.toFixed(2) : scoreParams.take_profit_pct;
+  tpSource    = structTp.source;
+  tp1PriceUsd = structTp.tp_price_usd;
+  tp2PriceUsd = structTp.tp2_available ? structTp.tp2_price_usd : null;
+  tp1Source   = structTp.source;
+  tp2Source   = structTp.tp2_available ? structTp.tp2_source : 'fixed_score';
+} else {
+  tp1Pct      = scoreParams.early_tp_pct;
+  tp2Pct      = scoreParams.take_profit_pct;
+  tpSource    = 'early_derisk_score';
+  tp1PriceUsd = null;
+  tp2PriceUsd = null;
+  tp1Source   = 'early_derisk_score';
+  tp2Source   = 'fixed_score';
+}
+const takeProfitPct  = tp2Pct;  // full-exit level — stored on position for observability
+const hasPartialTp   = true;    // always use partial TP for Score 8+
+const trailingStopDistancePct = scoreParams.trailing_stop_distance_pct ?? null;
+// T_stark (Score 8B): structural thesis has no time boundary — trailing stop manages exit.
+// Catalyst (Score 8A): 10-day window before thesis expiry check (extended from 5).
+// Score 9/10: no time-bound thesis.
+const thesisValidUntil = (score === 8 && !tStark)
+  ? new Date(Date.now() + 10 * 24 * 3_600_000).toISOString()
   : null;
 const notionalEur              = notionalOverride ?? +(nav * scoreParams.notional_pct).toFixed(2);
 
@@ -263,14 +281,14 @@ if (dryRun) {
     ...(hasPartialTp ? {
       tp1_pct:          tp1Pct,
       tp2_pct:          tp2Pct,
-      tp1_price_usd:    structTp.tp_price_usd,
-      tp2_price_usd:    structTp.tp2_price_usd,
+      ...(tp1PriceUsd != null ? { tp1_price_usd: tp1PriceUsd } : {}),
+      ...(tp2PriceUsd != null ? { tp2_price_usd: tp2PriceUsd } : {}),
       tp1_quantity_pct: 0.5,
       tp2_quantity_pct: 0.5,
       tp1_hit:          false,
       tp2_hit:          false,
-      tp1_source:       structTp.source,
-      tp2_source:       structTp.tp2_source,
+      tp1_source:       tp1Source,
+      tp2_source:       tp2Source,
     } : {}),
     breakeven_trigger_pct: breakevenTriggerPct,
     state_after: {
@@ -357,18 +375,19 @@ state.open_positions.push({
   ...(hasPartialTp ? {
     tp1_pct:          tp1Pct,
     tp2_pct:          tp2Pct,
-    tp1_price_usd:    structTp.tp_price_usd,
-    tp2_price_usd:    structTp.tp2_price_usd,
+    ...(tp1PriceUsd != null ? { tp1_price_usd: tp1PriceUsd } : {}),
+    ...(tp2PriceUsd != null ? { tp2_price_usd: tp2PriceUsd } : {}),
     tp1_quantity_pct: 0.5,
     tp2_quantity_pct: 0.5,
     tp1_hit:          false,
     tp2_hit:          false,
-    tp1_source:       structTp.source,
-    tp2_source:       structTp.tp2_source,
+    tp1_source:       tp1Source,
+    tp2_source:       tp2Source,
   } : {}),
   ...(breakevenTriggerPct != null ? { breakeven_trigger_pct: breakevenTriggerPct, peak_pnl_pct: 0, breakeven_activated: false } : {}),
   ...(trailingStopDistancePct != null ? { trailing_stop_distance_pct: trailingStopDistancePct } : {}),
   ...(thesisValidUntil != null ? { thesis_valid_until: thesisValidUntil, thesis_status: 'active' } : {}),
+  ...(tStark ? { t_stark: true } : {}),
   leverage:           1,
   entry_timestamp:    new Date().toISOString(),
   entry_run_id:       runId,
@@ -422,14 +441,14 @@ process.stdout.write(JSON.stringify({
   ...(hasPartialTp ? {
     tp1_pct:          tp1Pct,
     tp2_pct:          tp2Pct,
-    tp1_price_usd:    structTp.tp_price_usd,
-    tp2_price_usd:    structTp.tp2_price_usd,
+    ...(tp1PriceUsd != null ? { tp1_price_usd: tp1PriceUsd } : {}),
+    ...(tp2PriceUsd != null ? { tp2_price_usd: tp2PriceUsd } : {}),
     tp1_quantity_pct: 0.5,
     tp2_quantity_pct: 0.5,
     tp1_hit:          false,
     tp2_hit:          false,
-    tp1_source:       structTp.source,
-    tp2_source:       structTp.tp2_source,
+    tp1_source:       tp1Source,
+    tp2_source:       tp2Source,
   } : {}),
   order_id:        order.order_id,
   run_id:          runId,

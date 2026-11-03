@@ -458,6 +458,98 @@ const MANUAL_CLOSE = fileURLToPath(new URL('../manual_close.mjs', import.meta.ur
     `dry-run no blocked_until: exit 0, block_type=default_30d, blocked_until=+30d (${detail})`);
 }
 
+// ─── TC-17: partial TP1 fires → 50% partial close, SL→BE, position survives ──
+// Entry: 108 USD / 1.08 = 100 EUR. Mark at +7%: 108 * 1.07 = 115.56 USD → 107 EUR.
+// tp1_pct=7 triggers: close 50% (qty 0.5), SL moved to 0% (breakeven), position survives.
+
+{
+  const pos = makePos({
+    symbol:           'TSTTC17',
+    side:             'long',
+    stop_loss_pct:    3.3,
+    tp1_pct:          7,
+    tp2_pct:          18,
+    tp1_quantity_pct: 0.5,
+    tp2_quantity_pct: 0.5,
+    tp1_hit:          false,
+    tp2_hit:          false,
+    tp1_source:       'early_derisk_score',
+    tp2_source:       'fixed_score',
+  });
+  const state = makeState([pos]);
+  const runOutput = { long_candidates: [{ symbol: 'TSTTC17', price_usd: 115.56 }], short_candidates: [] };
+
+  const result = withTestState('tc17', state, () =>
+    runPortfolio(runOutput, [], { runId: 'test_tc17' })
+  );
+
+  const outPos         = result.open_positions.find(p => p.symbol === 'TSTTC17');
+  const notClosed      = !result.closed_this_run.some(c => c.symbol === 'TSTTC17');
+  const slAtBe         = outPos?.stop_loss_pct === 0;
+  const notionalHalved = outPos?.notional_eur != null && outPos.notional_eur < 60;
+  check('TC-17',
+    notClosed && outPos != null && slAtBe && notionalHalved,
+    `partial TP1 fires: position survives (not closed), SL→BE (stop_loss_pct=0), notional halved`);
+}
+
+// ─── TC-18: t_stark position (no thesis_valid_until) → HELD, thesis_expired=false ─
+
+{
+  const pos = makePos({
+    symbol:             'TSTTC18',
+    side:               'long',
+    t_stark:            true,
+    thesis_valid_until: null,
+  });
+  const state = makeState([pos]);
+  const runOutput = { long_candidates: [{ symbol: 'TSTTC18', price_usd: 108 }], short_candidates: [] };
+
+  const result = withTestState('tc18', state, () =>
+    runPortfolio(runOutput, [], { runId: 'test_tc18' })
+  );
+
+  const outPos    = result.open_positions.find(p => p.symbol === 'TSTTC18');
+  const notClosed = !result.closed_this_run.some(c => c.symbol === 'TSTTC18');
+  check('TC-18',
+    outPos != null && notClosed && outPos.thesis_expired === false,
+    't_stark position (thesis_valid_until=null): HELD, thesis_expired=false');
+}
+
+// ─── TC-19: partial TP2 fires after tp1_hit=true → full close, reason=partial_tp2_hit ─
+// Simulates state after TP1 already fired (qty halved to 0.5, tp1_hit=true, SL at BE).
+// Mark at +18%: 108 * 1.18 = 127.44 USD → 118 EUR. tp2_pct=18 → triggers full close.
+
+{
+  const pos = makePos({
+    symbol:           'TSTTC19',
+    side:             'long',
+    quantity:         0.5,
+    notional_eur:     50,
+    stop_loss_pct:    0,
+    tp1_pct:          7,
+    tp2_pct:          18,
+    tp1_quantity_pct: 0.5,
+    tp2_quantity_pct: 0.5,
+    tp1_hit:          true,
+    tp2_hit:          false,
+    tp1_source:       'early_derisk_score',
+    tp2_source:       'fixed_score',
+  });
+  const state = makeState([pos]);
+  const runOutput = { long_candidates: [{ symbol: 'TSTTC19', price_usd: 127.44 }], short_candidates: [] };
+
+  const result = withTestState('tc19', state, () =>
+    runPortfolio(runOutput, [], { runId: 'test_tc19' })
+  );
+
+  const tp2Closed = result.closed_this_run.some(c =>
+    c.symbol === 'TSTTC19' && c.reason === 'partial_tp2_hit'
+  );
+  check('TC-19',
+    tp2Closed,
+    'partial TP2 fires after tp1_hit=true: position closed with reason=partial_tp2_hit');
+}
+
 // ─── Final report ─────────────────────────────────────────────────────────────
 
 const passed = RESULTS.filter(r => r.status === 'PASS').length;
