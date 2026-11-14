@@ -44,7 +44,9 @@ import { PaperBroker }           from '../paper_broker.mjs';
 import { realismEnabled }        from '../realism_config.mjs';
 import { alertSlProximity, alertTakeProfitHit, alertBreakevenActivated, alertBreakevenHit } from '../../notify.mjs';
 
-const LOGS_DIR = 'C:\\Users\\rapha\\.claude\\trading\\logs';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+const LOGS_DIR   = join(__dirname, '..', '..', '..', 'trading', 'logs');
 
 // Read the most recent btc_mark_price_usd from portfolio history for benchmark delta.
 function readLastBtcMarkPrice() {
@@ -1204,8 +1206,8 @@ export function runPortfolio(runOutput, decisions, opts = {}) {
     state_file:          PORTFOLIO_PATHS.state,
     history_file:        PORTFOLIO_PATHS.history,
     ledger_file:         PORTFOLIO_PATHS.ledger,
-    orders_dir:          'C:\\Users\\rapha\\.claude\\trading\\execution\\orders',
-    order_events_file:   'C:\\Users\\rapha\\.claude\\trading\\execution\\orders\\order_events.jsonl',
+    orders_dir:          join(__dirname, '..', '..', '..', 'trading', 'execution', 'orders'),
+    order_events_file:   join(__dirname, '..', '..', '..', 'trading', 'execution', 'orders', 'order_events.jsonl'),
   };
 }
 

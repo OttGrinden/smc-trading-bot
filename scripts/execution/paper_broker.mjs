@@ -25,7 +25,8 @@
  */
 
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync, appendFileSync } from 'fs';
-import { join }                from 'path';
+import { join, dirname }       from 'path';
+import { fileURLToPath }       from 'url';
 import { makePaperOrder, ORDER_STATES }          from './schemas.mjs';
 import { transition }                            from './order_state.mjs';
 import { auditLog }                              from './audit_log.mjs';
@@ -33,7 +34,9 @@ import { realismEnabled }                        from './realism_config.mjs';
 import { buildFillDetails }                      from './fill_model.mjs';
 import { EUR_USD_RATE }                          from './portfolio/portfolio_state.mjs';
 
-const ORDERS_DIR        = 'C:\\Users\\rapha\\.claude\\trading\\execution\\orders';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+const ORDERS_DIR = join(__dirname, '..', '..', 'trading', 'execution', 'orders');
 const ORDER_EVENTS_LOG  = join(ORDERS_DIR, 'order_events.jsonl');
 
 // Stub account — replace with real account object when live

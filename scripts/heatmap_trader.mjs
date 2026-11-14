@@ -37,6 +37,8 @@ const MIN_WALL_USD     = 3_000_000;   // min wall notional $3M
 const HEATMAP_SCORE    = 8;           // technical signal → score 8, SL 3.3%, 5% NAV
 const HEATMAP_REASON   = 'heatmap_short_squeeze';
 const MAX_HEATMAP_AGE_MIN = 16;       // reject stale cache (>16 min old)
+// Ceiling8-bypass is NOT available for heatmap signals (Score 8).
+// Only smc_scan.mjs dispatches Score 9+ signals that may bypass ceiling8 blocks.
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -120,6 +122,7 @@ for (const sym of HEATMAP_SYMBOLS) {
     wall_pct_away:     wall.pct_away,
     squeeze:      entry.squeeze_potential,
     heatmap_age_min: Math.round(ageMin),
+    bypass_ceiling8: false,
   });
 
   log({
@@ -160,6 +163,7 @@ if (!LIVE) {
       '--reason',    sig.reason,
       '--category',  'crypto',
       '--price-usd', String(sig.current_price),
+      ...(sig.bypass_ceiling8 ? ['--bypass-direction-flip-ceiling8'] : []),
     ], { stdio: ['ignore', 'pipe', 'inherit'], timeout: 30_000 });
 
     if (result.error || result.status !== 0) {
@@ -218,8 +222,12 @@ if (!LIVE) {
       b.symbol === sig.symbol && b.side === sig.side &&
       (b.blocked_until == null || new Date(b.blocked_until) > now)
     );
-    if (isBlocked) {
+    const isCeiling8Block = /direction_flip.*ceiling8/i.test(isBlocked?.reason ?? '');
+    if (isBlocked && !(sig.bypass_ceiling8 && isCeiling8Block)) {
       log({ warn: 'heatmap_trader_live_blocked', symbol: sig.symbol, reason: 'blocked_symbol' }); blocked++; continue;
+    }
+    if (isBlocked && sig.bypass_ceiling8 && isCeiling8Block) {
+      log({ info: 'heatmap_trader_ceiling8_bypass', symbol: sig.symbol, ratio: sig.buy_sell_ratio, wall_usd: sig.wall_notional_usd });
     }
     // Policy: cash floor
     const notionalEur  = +(nav * NOTIONAL_PCT).toFixed(2);

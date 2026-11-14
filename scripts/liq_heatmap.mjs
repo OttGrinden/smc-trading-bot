@@ -243,6 +243,8 @@ async function main() {
         biggest_sell:   result.biggest_sell_wall
           ? `$${result.biggest_sell_wall.price.toFixed(2)} $${(result.biggest_sell_wall.notional_usd/1000).toFixed(0)}k (+${result.biggest_sell_wall.pct_away}%)`
           : null,
+        ask_levels:     result.ask_levels,
+        bid_levels:     result.bid_levels,
       }) + '\n');
     } catch (e) {
       failed++;

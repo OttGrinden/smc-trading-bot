@@ -6,7 +6,7 @@
  */
 
 import { writeFileSync, appendFileSync, mkdirSync, existsSync, readFileSync, statSync, unlinkSync, readdirSync } from 'fs';
-import { join, resolve } from 'path';
+import { dirname, join, resolve } from 'path';
 import { execFileSync }                                                                              from 'child_process';
 import { assessRisk }                                from './risk_scorer.mjs';
 import { readIndicatorCache, readClosesFromCache }   from './indicator_cache.mjs';

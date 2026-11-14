@@ -5,10 +5,41 @@ __pycache__/
 
 # Environment / credentials — NEVER commit
 .env
+.credentials.json
+
+# Claude Code runtime & personal data — NEVER commit
+history.jsonl
+projects/
+sessions/
+telemetry/
+paste-cache/
+shell-snapshots/
+file-history/
+evals/
+plugins/
+skills/
+backups/
+cache/
+settings.local.json
+scheduled_tasks.lock
+.last-cleanup
+
+# Patch files
+*.patch
+
+# Temp / adhoc scripts
+scripts/_adhoc_*.mjs
+scripts/_write_*.py
+
+# Headless runner scripts (contain machine-specific paths)
+scripts/run_headless_research.ps1
+scripts/run_headless_research.vbs
+scripts/headless_prompt.md
 
 # Trading runtime data (generated locally, not in repo)
 trading/cache/
 trading/logs/
+trading/memory/
 trading/execution/portfolio/
 trading/execution/orders/
 trading/execution/live_orders/

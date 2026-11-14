@@ -6,7 +6,7 @@
  */
 
 import { writeFileSync, readFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { dirname, join, resolve } from 'path';
 import { fileURLToPath }               from 'url';
 const _d = dirname(fileURLToPath(import.meta.url));
 const TRADING_DIR = resolve(_d, '..', 'trading');

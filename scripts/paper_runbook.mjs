@@ -142,6 +142,58 @@ if (RUN_SCAN) {
   const scanPath = path.join(cwd, 'scripts', 'smc_scan.mjs');
   console.log(`\nRunning scan: node ${scanPath}`);
   const result = spawnSync(process.execPath, [scanPath], { stdio: 'inherit' });
+
+  // --- Mark-to-market: update open positions with current heatmap prices ---
+  try {
+    const liqPath   = path.join(cacheDir, 'liq_heatmap.json');
+    const statePath = path.join(cwd, 'trading', 'execution', 'portfolio', 'portfolio_state.json');
+    if (fs.existsSync(liqPath) && fs.existsSync(statePath)) {
+      const liq   = JSON.parse(fs.readFileSync(liqPath, 'utf8'));
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      if (Array.isArray(state.open_positions) && state.open_positions.length > 0) {
+        let updated = false;
+        const now = new Date().toISOString();
+        for (const pos of state.open_positions) {
+          const entry = liq[pos.symbol];
+          if (!entry?.current_price) continue;
+          const newUsd = entry.current_price;
+          // Simple EUR conversion: use entry EUR/USD ratio as proxy (no live FX needed)
+          const entryRatio = pos.entry_price_eur && pos.entry_price_usd
+            ? pos.entry_price_eur / pos.entry_price_usd : null;
+          const newEur = entryRatio ? +(newUsd * entryRatio).toFixed(6) : pos.mark_price_eur;
+          const dirFactor = pos.side === 'short' ? -1 : 1;
+          const pnlEur = entryRatio
+            ? +((newEur - pos.entry_price_eur) * dirFactor * pos.quantity).toFixed(4)
+            : 0;
+          pos.mark_price_usd    = newUsd;
+          pos.mark_price_eur    = newEur;
+          pos.unrealized_pnl_eur = pnlEur;
+          pos.mark_source       = 'liq_heatmap';
+          pos.mark_updated_at   = now;
+          updated = true;
+        }
+        if (updated) {
+          // Recompute portfolio-level unrealized PnL and NAV
+          const totalUnrealized = state.open_positions
+            .reduce((s, p) => s + (p.unrealized_pnl_eur ?? 0), 0);
+          state.unrealized_pnl = +totalUnrealized.toFixed(4);
+          state.equity_nav     = +(state.cash + state.gross_exposure + totalUnrealized).toFixed(4);
+          state.last_updated_at = now;
+          fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
+          process.stderr.write(JSON.stringify({
+            info: 'mark_to_market_ok',
+            positions: state.open_positions.map(p => ({
+              symbol: p.symbol, mark_usd: p.mark_price_usd, unrealized_eur: p.unrealized_pnl_eur,
+            })),
+            equity_nav: state.equity_nav,
+          }) + '\n');
+        }
+      }
+    }
+  } catch (e) {
+    process.stderr.write(JSON.stringify({ warn: 'mark_to_market_failed', detail: e.message }) + '\n');
+  }
+
   process.exit(result.status ?? 0);
 }
 

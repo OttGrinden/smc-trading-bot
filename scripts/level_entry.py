@@ -2,31 +2,34 @@
 """
 level_entry.py -- 882/LSOB + Inducement Limit-Order Pfad
 
-Timeframe-Hierarchie (fix):
-  Daily + 4H : Strukturbias (HH/HL=LONG, LH/LL=SHORT) + EMA200-Alignment Daily
-  4H / 1H    : Entry-Level-Anker -- 882-Fib des gueltigen BOS-Legs (4H bevorzugt)
-               + Entry-IDM-Erkennung (1H-Swing nahe 882-Level)
-  15m        : Bestaetigung -- LSOB-Sweep (Wick nimmt Level, Close kehrt zurueck)
+Gate-Kaskade (fest, keine KI-Interpretation):
+  G1 : OHLCV Daily >= 200 Kerzen, 4H >= 20; 1H/15m vorhanden und gueltig
+  G2 : Daily-Bias bestimmbar (HH/HL=LONG, LH/LL=SHORT)
+  G3 : EMA200 Daily: LONG nur oberhalb; SHORT kein EMA-Filter
+  G4 : 4H-Bias darf Daily nicht explizit widersprechen (None erlaubt)
+  G5 : 882-Level aus 4H-BOS berechnen (Fallback: 1H); keine Anker = kein Signal
+  G6 : Heatmap-Freshness global < LIQ_MAX_AGE_MIN
+  G7 : Heatmap-Freshness pro Symbol < LIQ_MAX_AGE_MIN; Symbol fehlend = kein Signal
+  G8 : Preis-Proximity: weit entfernt -> armed speichern; nah -> Trigger-Pipeline
+  G9 : Liq-Cluster innerhalb LIQ_ATR_FACTOR * ATR hinter 882-Level;
+       Notional muss bekannt und > 0 sein (fail-closed, nicht Score-8-Fallback)
+  G10: 15m LSOB-Sweep: Wick jenseits 882-Level, Schlusskurs kehrt zurueck
+       (15m darf Bias und Level NICHT bestimmen -- nur Bestaetigung)
+  G11: Kein Duplikat / max MAX_LEVEL_POSITIONS aktive Level-Positionen
+  G12: Netto-RRR nach Gebuehren/Slippage >= MIN_NET_RRR
+       fail-closed: kein Signal wenn MIN_NET_RRR None oder unterschritten
 
-Bedingungen pro Symbol:
-  1. Daily bias = 4H bias (beide muessen aligniert sein)
-  2. EMA200 auf Daily ausgerichtet zur Richtung
-  3. 882-Fib-Level auf 4H berechnet (Fallback: 1H)
-  4. Liq-Cluster <= 0.5 ATR hinter Entry-Level (Pflicht)
-  5. Preis < 0.5 ATR vom Level entfernt
-  6. Entry-IDM (1H-Swing nahe 882): wenn gefunden -> Sweep Pflicht vor Signal
-     Kein IDM nahe Level -> Signal feuert ohne IDM-Gate (Backward-compat)
-  7. 15m LSOB-Sweep bestaetigt (Wick jenseits Level, Close kehrt zurueck)
-  8. Kein HTF-Strukturbruch (4H/Daily Close verletzt letztes HL/LH)
+Score nach Bestehen aller Gates (G1-G12):
+  Score 9 : cluster.notional_usd >= LIQ_SCORE9_THRESHOLD
+  Score 8 : cluster.notional_usd  < LIQ_SCORE9_THRESHOLD
+  notional_usd == 0 oder fehlend = kein Signal (fail-closed, nicht Score-8-Fallback)
 
-IDM-State: `idm_pending` -- IDM nahe Level gefunden, Sweep noch ausstehend.
-  Wird ueber Runs hinweg persistiert. Sobald Sweep eintrifft -> Signal.
-
-Guards: Max 1 Order/Symbol+Seite - Max 2 Level-Positionen gesamt
+Routing (smc_scan.mjs):
+  Score 8 -> direkt auto_open (kein Reviewer)
+  Score 9 -> thesis_reviewer -> auto_open
 
 stdout: NDJSON -- je Signal eine Zeile mit action="open_level_order"
-        Signal enthaelt: idm_price, idm_dist_atr, idm_validated
-stderr: Debug-Zeilen + level_entry_summary
+stderr: gate_fail / info / warn NDJSON-Zeilen (erster Ablehnungsgrund pro Symbol)
 Exit:   immer 0 (fail-soft)
 """
 
@@ -36,6 +39,8 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -47,20 +52,36 @@ AUDIT_DIR      = str(_BASE / 'trading' / 'execution' / 'audit')
 SMC_SYMBOLS    = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'TAO']
 STATE_PATH     = os.path.join(CACHE_DIR, 'level_entry_state.json')
 
+# -- Gate-Parameter (Konfiguration) -------------------------------------------
 FIB_882             = 0.882
-APPROACH_ATR_FACTOR = 0.5   # Preis innerhalb 0.5 ATR vom Level
-LIQ_ATR_FACTOR      = 0.5   # Liq-Cluster innerhalb 0.5 ATR hinter Level
-SWEEP_LOOKBACK_15M  = 4     # letzte 4 x 15m = 1h Fenster fuer LSOB-Check
-MAX_LEVEL_POSITIONS = 2     # gesamt aktive Level-Positionen
-LIQ_MAX_AGE_MIN     = 20
-PIVOT_LEN_D         = 2     # Daily: 5-Bar-Fraktal
-PIVOT_LEN_HTF       = 3     # 4H/1H: 7-Bar-Fraktal
-EMA_PERIOD          = 200
+APPROACH_ATR_FACTOR = 0.5    # G8: Preis innerhalb 0.5 ATR vom Level = Trigger
+LIQ_ATR_FACTOR      = 0.5    # G9: Liq-Cluster innerhalb 0.5 ATR hinter Level
+SWEEP_LOOKBACK_15M  = 4      # G10: letzte 4 x 15m = 1h Fenster fuer LSOB-Check
+MAX_LEVEL_POSITIONS = 2      # G11: gesamt aktive Level-Positionen
+LIQ_MAX_AGE_MIN     = 20     # G6/G7: Heatmap-Alter-Schwelle (Minuten)
+LIQ_SCORE9_THRESHOLD = 5_000_000  # Score 9 ab diesem Cluster-Notional (USD)
+PIVOT_LEN_D         = 2      # Daily: 5-Bar-Fraktal
+PIVOT_LEN_HTF       = 3      # 4H/1H: 7-Bar-Fraktal
+EMA_PERIOD          = 200    # G3: Daily EMA-Periode
 
-# IDM-spezifische Konstanten
+# -- RRR-Gate (G12) -- fail-closed wenn MIN_NET_RRR None oder unterschritten --
+# MIN_NET_RRR = None blockiert alle Signale (kein Handel ohne konfiguriertes Minimum)
+MIN_NET_RRR  : Optional[float] = 2.0   # Mindest-Netto-RRR nach Gebuehren/Slippage
+FEE_PCT      : float           = 0.05  # Bitunix Futures Maker-Fee pro Seite (%)
+SLIPPAGE_PCT : float           = 0.05  # Konservative Slippage-Schaetzung pro Seite (%)
+
+# -- IDM-spezifische Konstanten ------------------------------------------------
 IDM_ZONE_ATR_FACTOR    = 1.0  # IDM muss innerhalb 1.0 ATR des 882-Levels liegen
 IDM_LOOKBACK_1H        = 24   # max. 24 x 1H-Bars zurueck fuer Entry-IDM-Suche
 IDM_SWEEP_LOOKBACK_15M = 8    # letzte 8 x 15m = 2h fuer IDM-Sweep-Check
+
+
+# -- Gate-Rejection-Logger -----------------------------------------------------
+
+def gate_reject(symbol: str, reason: str, **extra) -> None:
+    """Loggt den ersten Ablehnungsgrund pro Symbol einheitlich."""
+    print(json.dumps({'gate_fail': symbol, 'reason': reason, **extra}),
+          file=sys.stderr)
 
 
 # -- Pivot-Erkennung -----------------------------------------------------------
@@ -186,16 +207,6 @@ def calc_882_level(candles: list, direction: str,
 
 def find_entry_idm(candles_1h: list, fib_882: float, direction: str,
                    atr: float, pivot_len: int = 2) -> Optional[dict]:
-    """
-    Sucht den juengsten 1H-Inducement nahe dem 882-Entry-Level.
-
-    Fuer LONG:  Swing-Low  innerhalb [fib_882 - zone, fib_882 + zone*0.25]
-    Fuer SHORT: Swing-High innerhalb [fib_882 - zone*0.25, fib_882 + zone]
-
-    Wenn gefunden und nicht gesweept -> idm_pending (Entry wartet).
-    Wenn gefunden und gesweept       -> idm_validated=True (Entry feuert).
-    Kein IDM gefunden                -> kein Gate (bestehende Logik greift).
-    """
     if not candles_1h:
         return None
     highs, lows  = find_pivots(candles_1h, pivot_len)
@@ -229,10 +240,6 @@ def find_entry_idm(candles_1h: list, fib_882: float, direction: str,
 
 def check_entry_idm_swept(candles_1h: list, candles_15m: Optional[list],
                            idm: dict, direction: str) -> bool:
-    """
-    Prueft ob der Entry-IDM gesweept wurde.
-    1H post-IDM-Candles + letzte IDM_SWEEP_LOOKBACK_15M 15m-Candles.
-    """
     idm_price = idm['price']
     idm_idx   = idm['idx']
 
@@ -318,7 +325,9 @@ def calc_level_sl(candles_15m: list, fib_882: float,
         return round(extreme + 0.1 * atr, 6)
 
 
-# -- 15m LSOB-Sweep-Bestaetigung -----------------------------------------------
+# -- G10: 15m LSOB-Sweep-Bestaetigung -----------------------------------------
+# Exakte Regel: Wick nimmt 882-Level (ueberschreitet es), Schlusskurs kehrt zurueck.
+# 15m bestimmt WEDER Bias noch Level -- nur Bestaetigung.
 
 def check_lsob_sweep(candles_15m: list, fib_882: float, direction: str) -> bool:
     for c in candles_15m[-SWEEP_LOOKBACK_15M:]:
@@ -343,6 +352,35 @@ def is_htf_invalidated(candles_daily: list, candles_4h: list,
     return False
 
 
+# -- G12: Netto-RRR berechnen --------------------------------------------------
+
+def calc_net_rrr(entry: float, sl: float, tp: float,
+                 direction: str) -> Optional[float]:
+    """
+    Berechnet Netto-RRR nach Gebuehren und Slippage (round-trip).
+    Gibt None zurueck wenn SL-Distanz <= 0 oder TP-Distanz <= Kosten.
+    """
+    if direction == 'long':
+        gross_sl = entry - sl
+        gross_tp = tp - entry
+    else:
+        gross_sl = sl - entry
+        gross_tp = entry - tp
+
+    if gross_sl <= 0:
+        return None
+
+    # Round-trip: Entry-Seite + Exit-Seite
+    rt_cost = entry * (FEE_PCT + SLIPPAGE_PCT) / 100.0 * 2
+    net_sl  = gross_sl + rt_cost
+    net_tp  = gross_tp - rt_cost
+
+    if net_tp <= 0 or net_sl <= 0:
+        return None
+
+    return round(net_tp / net_sl, 3)
+
+
 # -- State-Datei ---------------------------------------------------------------
 
 def load_state() -> list:
@@ -357,8 +395,28 @@ def load_state() -> list:
 
 
 def save_state(state: list) -> None:
-    with open(STATE_PATH, 'w', encoding='utf-8') as fh:
-        json.dump(state, fh, indent=2)
+    # Run the write on a daemon thread with a 3s timeout.
+    # On Windows, tempfile.mkstemp / os.replace deadlocks when a zombie Python process
+    # from a previous timed-out scan still holds a lock on the cache dir or state file.
+    # The daemon thread dies with the process if abandoned — no main-thread hang.
+    def _write():
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR, suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                    json.dump(state, fh, indent=2)
+                os.replace(tmp_path, STATE_PATH)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    t = threading.Thread(target=_write, daemon=True)
+    t.start()
+    t.join(timeout=3.0)
+    # If still running after 3s, write is abandoned (non-fatal: state re-derived next scan)
 
 
 # -- Portfolio: aktive Level-Positionen zaehlen --------------------------------
@@ -407,7 +465,7 @@ def load_ohlcv(fname: str, min_candles: int = 10) -> Optional[list]:
 # -- Main ----------------------------------------------------------------------
 
 def main() -> None:
-    # 1. Liq-Heatmap Freshness-Gate (fail-safe)
+    # G6: Liq-Heatmap Freshness-Gate global (via BTC-Timestamp als Proxy)
     liq_path = os.path.join(CACHE_DIR, 'liq_heatmap.json')
     if not os.path.exists(liq_path):
         print(json.dumps({'info': 'level_entry_skip', 'reason': 'liq_missing'}),
@@ -417,6 +475,8 @@ def main() -> None:
         with open(liq_path, encoding='utf-8') as fh:
             liq_data = json.load(fh)
     except Exception:
+        print(json.dumps({'info': 'level_entry_skip', 'reason': 'liq_parse_error'}),
+              file=sys.stderr)
         sys.exit(0)
 
     btc_updated = liq_data.get('BTC', {}).get('updated_at', '')
@@ -433,7 +493,7 @@ def main() -> None:
         except Exception:
             pass
 
-    # 2. State + offene Level-Positionen
+    # State + offene Level-Positionen
     state            = load_state()
     open_positions   = count_level_positions()
     signals_this_run = 0
@@ -441,49 +501,62 @@ def main() -> None:
     state_changes    = 0
 
     for symbol in SMC_SYMBOLS:
+        # G1: OHLCV-Daten vorhanden und ausreichend
         candles_d   = load_ohlcv(f'ohlcv_daily_{symbol}.json', min_candles=EMA_PERIOD)
         candles_4h  = load_ohlcv(f'ohlcv_4h_{symbol}.json',    min_candles=20)
         candles_1h  = load_ohlcv(f'ohlcv_1h_{symbol}.json',    min_candles=20)
         candles_15m = load_ohlcv(f'ohlcv_15m_{symbol}.json',   min_candles=SWEEP_LOOKBACK_15M)
 
-        if not candles_d or not candles_4h:
-            print(json.dumps({'debug': f'{symbol}: daily/4H fehlt'}), file=sys.stderr)
+        if not candles_d:
+            gate_reject(symbol, 'g1_daily_missing_or_insufficient',
+                        required=EMA_PERIOD)
             continue
+        if not candles_4h:
+            gate_reject(symbol, 'g1_4h_missing_or_insufficient', required=20)
+            continue
+        # 1H und 15m werden fuer ihre jeweiligen Pruefungen benoetigt;
+        # Fehlen wird an den zustaendigen Gates G10/IDM protokolliert.
 
-        # 3. Daily Bias + EMA200
+        # G2: Daily-Bias bestimmbar
         bias_d = detect_bias(candles_d, PIVOT_LEN_D)
         if bias_d is None:
-            print(json.dumps({'debug': f'{symbol}: daily bias ambiguous'}), file=sys.stderr)
+            gate_reject(symbol, 'g2_daily_bias_ambiguous')
             continue
 
+        # G3: EMA200 Daily -- LONG nur oberhalb; SHORT kein EMA-Filter
         ema200    = calc_ema([c['close'] for c in candles_d], EMA_PERIOD)
         if ema200 is None:
+            gate_reject(symbol, 'g3_ema200_insufficient_data')
             continue
         cur_daily = candles_d[-1]['close']
-        if not ((bias_d == 'long'  and cur_daily > ema200) or
-                (bias_d == 'short' and cur_daily < ema200)):
-            print(json.dumps({'debug': f'{symbol}: EMA200 nicht aligned fuer {bias_d}'}),
-                  file=sys.stderr)
+        if bias_d == 'long' and cur_daily <= ema200:
+            gate_reject(symbol, 'g3_ema200_long_below',
+                        cur=round(cur_daily, 2), ema200=round(ema200, 2))
             continue
 
-        # 4. 4H Bias muss Daily entsprechen
+        # G4: 4H-Bias darf Daily nicht explizit widersprechen (None erlaubt)
         bias_4h = detect_bias(candles_4h, PIVOT_LEN_HTF)
-        if bias_4h != bias_d:
-            print(json.dumps({'debug': f'{symbol}: 4H={bias_4h} != Daily={bias_d}'}),
-                  file=sys.stderr)
+        if bias_4h is None:
+            bias_4h = detect_bias(candles_4h, max(1, PIVOT_LEN_HTF - 1))
+        if bias_4h is not None and bias_4h != bias_d:
+            gate_reject(symbol, 'g4_4h_contradicts_daily',
+                        bias_4h=bias_4h, bias_d=bias_d)
             continue
+        if bias_4h is None:
+            print(json.dumps({'info': 'g4_4h_ambiguous_daily_dominates',
+                               'symbol': symbol, 'bias_d': bias_d}),
+                  file=sys.stderr)
 
         direction = bias_d
 
-        # 5. 882-Fib-Level -- 4H bevorzugt, Fallback 1H
+        # G5: 882-Level aus 4H-BOS berechnen (Fallback: 1H)
         level_info = calc_882_level(candles_4h, direction, PIVOT_LEN_HTF)
         tf_label   = '4H'
         if level_info is None and candles_1h:
             level_info = calc_882_level(candles_1h, direction, PIVOT_LEN_HTF)
             tf_label   = '1H'
         if level_info is None:
-            print(json.dumps({'debug': f'{symbol}: kein 882-Level auf 4H/1H'}),
-                  file=sys.stderr)
+            gate_reject(symbol, 'g5_no_882_level', direction=direction)
             continue
 
         fib_882   = level_info['fib_882']
@@ -494,15 +567,20 @@ def main() -> None:
         cur_price = (candles_15m[-1]['close'] if candles_15m
                      else candles_4h[-1]['close'])
 
-        # 6. Bestehende State-Eintraege validieren / invalidieren
+        # Bestehende State-Eintraege validieren / invalidieren
         for s in state:
             if s['symbol'] != symbol:
                 new_state.append(s)
                 continue
-            if s.get('status') not in ('watching', 'idm_pending'):
+            if s.get('status') not in ('watching', 'idm_pending', 'armed'):
                 new_state.append(s)
                 continue
-            if is_htf_invalidated(candles_d, candles_4h, s['side']):
+            # armed: nur invalidieren wenn Daily-Bias explizit gegensaetzlich ist
+            if s.get('status') == 'armed':
+                invalidated = (bias_d is not None and bias_d != s['side'])
+            else:
+                invalidated = is_htf_invalidated(candles_d, candles_4h, s['side'])
+            if invalidated:
                 s['status'] = 'invalid'
                 state_changes += 1
                 audit({'warn': 'level_order_invalidated', 'symbol': symbol,
@@ -514,11 +592,11 @@ def main() -> None:
                 new_state.append(s)
         state = [s for s in state if s['symbol'] != symbol]
 
-        # 7. Kein Duplikat; bei idm_pending: pruefen ob IDM inzwischen gesweept
+        # Duplikat-Check: armed -> Preis-Ankunft pruefen; idm_pending -> IDM-Sweep
         existing = next(
             (s for s in new_state
              if s['symbol'] == symbol and s['side'] == direction
-             and s.get('status') in ('watching', 'idm_pending')),
+             and s.get('status') in ('watching', 'idm_pending', 'armed')),
             None
         )
         if existing:
@@ -531,40 +609,98 @@ def main() -> None:
                     existing['status']    = 'watching'
                     existing['idm_swept'] = True
                     state_changes += 1
-                    print(json.dumps({'info': 'idm_swept_upgraded',
+                    print(json.dumps({'info': 'entry_idm_swept_upgraded',
+                                       'note': 'micro Entry-IDM (1H near Fib 882) swept — not BOS-IDM used by smc_detector',
                                        'symbol': symbol, 'side': direction,
                                        'idm_price': stored_idm['price']}),
                           file=sys.stderr)
+                continue
+            if existing.get('status') == 'armed':
+                if abs(cur_price - existing['fib_882']) >= APPROACH_ATR_FACTOR * atr_daily:
+                    dist_pct = round((cur_price - existing['fib_882']) / existing['fib_882'] * 100, 2)
+                    print(json.dumps({'info': 'level_armed_waiting', 'symbol': symbol,
+                                       'direction': direction, 'fib_882': existing['fib_882'],
+                                       'cur_price': cur_price, 'dist_pct': dist_pct}),
+                          file=sys.stderr)
+                    continue
+                # Preis angekommen -- entferne armed-Eintrag, falle durch zur Trigger-Pipeline
+                new_state = [s for s in new_state
+                             if not (s['symbol'] == symbol and s['side'] == direction
+                                     and s.get('status') == 'armed')]
+                print(json.dumps({'info': 'level_armed_triggered', 'symbol': symbol,
+                                   'direction': direction, 'fib_882': fib_882}),
+                      file=sys.stderr)
+                # Fall through to G7-G12
+            else:
+                # 'watching' = bereits gefeuert; Duplikat-Schutz
+                continue
+
+        # G8: Preis-Proximity -- weit entfernt -> armed speichern; nah -> Trigger
+        if abs(cur_price - fib_882) >= APPROACH_ATR_FACTOR * atr_daily:
+            dist_pct = round((cur_price - fib_882) / fib_882 * 100, 2)
+            print(json.dumps({'info': 'level_armed', 'symbol': symbol,
+                               'direction': direction, 'fib_882': fib_882,
+                               'cur_price': cur_price, 'dist_pct': dist_pct,
+                               'note': 'Level gespeichert -- warte auf Preis-Ankunft'}),
+                  file=sys.stderr)
+            audit({'info': 'level_armed', 'symbol': symbol, 'side': direction,
+                   'fib_882': fib_882, 'dist_pct': dist_pct})
+            new_state.append({
+                'symbol':    symbol,
+                'side':      direction,
+                'timeframe': tf_label,
+                'fib_882':   fib_882,
+                'status':    'armed',
+                'placed_ts': datetime.now(timezone.utc).isoformat(),
+            })
+            state_changes += 1
             continue
 
-        # 8. Liq-Cluster-Pflicht
+        # G7: Heatmap-Freshness pro Symbol
         liq_sym = liq_data.get(symbol.upper())
+        if not liq_sym:
+            gate_reject(symbol, 'g7_liq_symbol_missing')
+            continue
+        sym_updated = liq_sym.get('updated_at', '')
+        if not sym_updated:
+            gate_reject(symbol, 'g7_liq_symbol_no_timestamp')
+            continue
+        try:
+            sym_age_min = (datetime.now(timezone.utc) -
+                           datetime.fromisoformat(sym_updated.replace('Z', '+00:00'))
+                           ).total_seconds() / 60
+            if sym_age_min > LIQ_MAX_AGE_MIN:
+                gate_reject(symbol, 'g7_liq_symbol_stale',
+                            age_min=round(sym_age_min, 1), max_age=LIQ_MAX_AGE_MIN)
+                continue
+        except Exception:
+            gate_reject(symbol, 'g7_liq_symbol_timestamp_parse_error')
+            continue
+
+        # G9: Liq-Cluster innerhalb LIQ_ATR_FACTOR * ATR hinter 882-Level
         cluster = find_liq_cluster(liq_sym, fib_882, direction, atr_daily)
         if cluster is None:
-            audit({'info': 'level_entry_no_liq_fuel', 'symbol': symbol,
+            gate_reject(symbol, 'g9_no_liq_cluster',
+                        direction=direction, fib_882=fib_882)
+            audit({'warn': 'level_entry_no_liq_fuel', 'symbol': symbol,
                    'direction': direction, 'fib_882': fib_882})
-            print(json.dumps({'info': 'level_entry_no_liq_fuel',
-                               'symbol': symbol, 'direction': direction}),
-                  file=sys.stderr)
             continue
 
-        # 9. Preis-Naehe (< 0.5 ATR vom Level)
-        if abs(cur_price - fib_882) >= APPROACH_ATR_FACTOR * atr_daily:
-            print(json.dumps({'debug': f'{symbol}: nicht nah genug -- '
-                                        f'cur={cur_price:.4f} fib={fib_882:.4f} '
-                                        f'dist={abs(cur_price-fib_882):.4f} '
-                                        f'0.5atr={0.5*atr_daily:.4f}'}),
-                  file=sys.stderr)
+        # G9b: Notional muss bekannt und > 0 sein (fail-closed, kein Score-8-Fallback)
+        raw_notional = cluster.get('notional_usd')
+        if not raw_notional or raw_notional <= 0:
+            gate_reject(symbol, 'g9_liq_notional_unknown_or_zero',
+                        cluster_price=cluster.get('price'),
+                        raw_notional=raw_notional)
             continue
 
-        # 10. Entry-IDM: 1H-Swing nahe 882-Level suchen und Sweep-Status pruefen
+        # G10: Entry-IDM -- 1H-Swing nahe 882-Level (optional, aber protokolliert)
         entry_idm     = find_entry_idm(candles_1h, fib_882, direction, atr_daily) if candles_1h else None
         idm_validated = False
 
         if entry_idm is not None:
             idm_swept = check_entry_idm_swept(candles_1h, candles_15m, entry_idm, direction)
             if not idm_swept:
-                # IDM gefunden, noch nicht gesweept -- in State speichern, warten
                 print(json.dumps({'info': 'idm_pending',
                                    'symbol': symbol, 'side': direction,
                                    'idm_price': entry_idm['price'],
@@ -574,41 +710,61 @@ def main() -> None:
                 audit({'info': 'idm_pending', 'symbol': symbol, 'side': direction,
                        'fib_882': fib_882, 'idm_price': entry_idm['price']})
                 new_state.append({
-                    'symbol':      symbol,
-                    'side':        direction,
-                    'timeframe':   tf_label,
-                    'fib_882':     fib_882,
-                    'status':      'idm_pending',
-                    'idm_price':   entry_idm['price'],
-                    'idm_idx':     entry_idm['idx'],
+                    'symbol':       symbol,
+                    'side':         direction,
+                    'timeframe':    tf_label,
+                    'fib_882':      fib_882,
+                    'status':       'idm_pending',
+                    'idm_price':    entry_idm['price'],
+                    'idm_idx':      entry_idm['idx'],
                     'idm_dist_atr': entry_idm['dist_atr'],
-                    'placed_ts':   datetime.now(timezone.utc).isoformat(),
+                    'placed_ts':    datetime.now(timezone.utc).isoformat(),
                 })
                 state_changes += 1
                 continue
             else:
                 idm_validated = True
-        # Kein IDM nahe Level -> kein Gate, Signal kann feuern
 
-        # 11. 15m LSOB-Sweep-Bestaetigung
+        # G10: 15m LSOB-Sweep-Bestaetigung (Wick jenseits Level, Close kehrt zurueck)
         if not candles_15m:
-            print(json.dumps({'debug': f'{symbol}: keine 15m-Daten'}), file=sys.stderr)
+            gate_reject(symbol, 'g10_15m_data_missing')
             continue
         if not check_lsob_sweep(candles_15m, fib_882, direction):
-            print(json.dumps({'debug': f'{symbol}: 15m-Sweep noch nicht bestaetigt'}),
-                  file=sys.stderr)
+            gate_reject(symbol, 'g10_15m_lsob_sweep_pending',
+                        fib_882=fib_882, direction=direction)
             continue
 
-        # 12. Max-Positionen-Guard
+        # G11: Max-Positionen-Guard
         if open_positions + signals_this_run >= MAX_LEVEL_POSITIONS:
-            print(json.dumps({'info': 'level_entry_max_positions', 'symbol': symbol,
-                               'active': open_positions + signals_this_run}),
-                  file=sys.stderr)
+            gate_reject(symbol, 'g11_max_positions',
+                        active=open_positions + signals_this_run,
+                        max=MAX_LEVEL_POSITIONS)
             continue
 
-        # 13. SL / TP berechnen und Signal ausgeben
+        # SL / TP berechnen (wird fuer G12 benoetigt)
         sl = calc_level_sl(candles_15m, fib_882, direction, atr_daily)
         tp = calc_level_tp(liq_sym, fib_882, h1, idm_htf, direction)
+
+        # G12: Netto-RRR nach Gebuehren und Slippage
+        if MIN_NET_RRR is None:
+            gate_reject(symbol, 'g12_rrr_no_min_config',
+                        note='MIN_NET_RRR not configured; fail-closed')
+            continue
+
+        net_rrr = calc_net_rrr(fib_882, sl, tp, direction)
+        if net_rrr is None:
+            gate_reject(symbol, 'g12_rrr_calc_failed',
+                        sl=sl, tp=tp, entry=fib_882, direction=direction)
+            continue
+        if net_rrr < MIN_NET_RRR:
+            gate_reject(symbol, 'g12_rrr_below_min',
+                        net_rrr=net_rrr, min_rrr=MIN_NET_RRR,
+                        sl=sl, tp=tp, entry=fib_882)
+            continue
+
+        # Score nach Bestehen aller Gates (G1-G12)
+        # notional_usd ist USD (liq_heatmap.mjs: price_usd * size = USD-Notional)
+        score = 9 if raw_notional >= LIQ_SCORE9_THRESHOLD else 8
 
         idm_label  = '_IDM' if idm_validated else ''
         reason_str = f'LEVEL_882_LSOB{idm_label}_{direction.upper()}_{tf_label}'
@@ -618,8 +774,11 @@ def main() -> None:
             'symbol':        symbol,
             'side':          direction,
             'fib_882':       fib_882,
+            'h1_price':      h1,
+            'origin_price':  idm_htf,
             'sl_price':      sl,
             'tp_price':      tp,
+            'net_rrr':       net_rrr,
             'atr_daily':     round(atr_daily, 6),
             'timeframe':     tf_label,
             'liq_cluster':   cluster,
@@ -627,15 +786,15 @@ def main() -> None:
             'idm_dist_atr':  entry_idm['dist_atr'] if entry_idm else None,
             'idm_validated': idm_validated,
             'reason':        reason_str,
-            'score':         8,
+            'score':         score,
         }
         print(json.dumps(signal))
         sys.stdout.flush()
 
         audit({'info': 'level_order_placed', 'symbol': symbol, 'side': direction,
                'timeframe': tf_label, 'fib_882': fib_882,
-               'sl_price': sl, 'tp_price': tp,
-               'atr_daily': round(atr_daily, 6),
+               'sl_price': sl, 'tp_price': tp, 'net_rrr': net_rrr,
+               'score': score,
                'liq_cluster_dist_atr': cluster.get('dist_atr'),
                'idm_validated': idm_validated,
                'idm_price': entry_idm['price'] if entry_idm else None,
