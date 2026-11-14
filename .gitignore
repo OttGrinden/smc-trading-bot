@@ -45,6 +45,7 @@ trading/execution/orders/
 trading/execution/live_orders/
 trading/execution/audit/
 trading/execution/decisions/
+trading/*.jsonl
 
 # Keep the registry (asset universe definition)
 !trading/registry/
