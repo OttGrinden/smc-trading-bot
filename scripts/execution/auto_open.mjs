@@ -90,6 +90,7 @@ const dryRun   = args.dryRun === true || args.dryRun === 'true';
 const tStark   = args.tStark === true || args.tStark === 'true';
 const notionalOverride = args.notionalEur ? parseFloat(args.notionalEur) : null;
 const priceUsdOverride = args.priceUsd   ? parseFloat(args.priceUsd)   : null;
+const bypassCeiling8   = args.bypassDirectionFlipCeiling8 === true || args.bypassDirectionFlipCeiling8 === 'true';
 const runId    = `auto_${new Date().toISOString().slice(0, 16).replace(/[T:]/g, '_')}`;
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -204,11 +205,19 @@ if (structTp) {
 const takeProfitPct  = tp2Pct;  // full-exit level — stored on position for observability
 const hasPartialTp   = true;    // always use partial TP for Score 8+
 const trailingStopDistancePct = scoreParams.trailing_stop_distance_pct ?? null;
-// T_stark (Score 8B): structural thesis has no time boundary — trailing stop manages exit.
-// Catalyst (Score 8A): 10-day window before thesis expiry check (extended from 5).
-// Score 9/10: no time-bound thesis.
-const thesisValidUntil = (score === 8 && !tStark)
-  ? new Date(Date.now() + 10 * 24 * 3_600_000).toISOString()
+// Thesis windows by signal type (tStark bypasses; Score 10 = no boundary):
+// heatmap_* → Score 8: 5d | Score 9: 7d
+// smc_detector (reason starts "Score N") → 7d
+// level_entry → 10d  |  other Score 9 catalyst → 14d
+// Score 8 non-heatmap → 14d  |  tStark → null  |  Score 10 → null
+const isHeatmapEntry = typeof reason === 'string' && reason.startsWith('heatmap_');
+const isSmcEntry     = typeof reason === 'string' && /^Score \d/.test(reason);
+const isLevelEntry   = typeof reason === 'string' && reason.startsWith('level_');
+const _thesisDays = tStark || score >= 10 ? null
+  : score === 9 ? (isHeatmapEntry ? 7 : isSmcEntry ? 7 : isLevelEntry ? 10 : 14)
+  : /* score 8 */ (isHeatmapEntry ? 5 : 14);
+const thesisValidUntil = _thesisDays != null
+  ? new Date(Date.now() + _thesisDays * 24 * 3_600_000).toISOString()
   : null;
 const notionalEur              = notionalOverride ?? +(nav * scoreParams.notional_pct).toFixed(2);
 
@@ -245,8 +254,21 @@ const blocked = (state.blocked_symbols || []).find(b =>
   (b.blocked_until == null || new Date(b.blocked_until) > now)
 );
 if (blocked) {
-  policyErrors.push(`symbol_blocked: ${symbol} ${side} — reason: ${blocked.reason}` +
-    (blocked.blocked_until ? ` until ${blocked.blocked_until}` : ' (permanent)'));
+  // SMC/Level Score 9+ can bypass direction_flip_ceiling8 blocks.
+  // These blocks were created by a score-≤8 signal; a score-9 conviction overrides them.
+  // bypassCeiling8 is only set by smc_scan.mjs for Score 9+ signals — never by heatmap_trader.
+  const isCeiling8Block = /direction_flip.*ceiling8/i.test(blocked.reason ?? '');
+  if (bypassCeiling8 && isCeiling8Block) {
+    process.stderr.write(JSON.stringify({
+      info:         'policy_gate_ceiling8_bypass',
+      symbol, side, score,
+      block_reason: blocked.reason,
+      note:         'direction_flip_ceiling8 block overridden by Score 9+ SMC signal',
+    }) + '\n');
+  } else {
+    policyErrors.push(`symbol_blocked: ${symbol} ${side} — reason: ${blocked.reason}` +
+      (blocked.blocked_until ? ` until ${blocked.blocked_until}` : ' (permanent)'));
+  }
 }
 
 // Gate 4: Duplicate position

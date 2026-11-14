@@ -40,9 +40,11 @@ const CLOSE_SCRIPT   = join(__dirname, 'execution/manual_close.mjs');
 const LOGS_DIR       = join(TRADING_DIR, 'logs');
 
 // Thresholds
-const STAGNANT_THRESHOLD   = 4;   // |pnl_pct| < 4% for thesis-expiry trigger
-const STAGNATION_DAYS      = 21;  // days open before stagnation check fires
-const STAGNATION_PCT       = 3;   // |pnl_pct| < 3% = stagnant
+const STAGNANT_THRESHOLD        = 4;   // |pnl_pct| < 4% for thesis-expiry trigger
+const STAGNATION_DAYS           = 21;  // days open before stagnation check fires (stocks / Score 10)
+const STAGNATION_PCT            = 3;   // |pnl_pct| < 3% = stagnant
+const STAGNATION_DAYS_CRYPTO    = 14;  // faster stagnation for crypto (no thesis window → Score 10 only)
+const STAGNATION_PCT_CRYPTO     = 2;   // tighter pct threshold for crypto
 const RSI_SHORT_EXHAUSTION = 40;  // SHORT: close when RSI drops below this (momentum exhausted)
 const RSI_LONG_EXHAUSTION  = 70;  // LONG:  close when RSI rises above this (momentum exhausted)
 const RSI_MIN_DAYS_OPEN    = 2;   // don't fire RSI exhaustion before 2 days open
@@ -133,7 +135,11 @@ for (const pos of state.open_positions) {
   }
 
   // ── Trigger 2: Stagnation ────────────────────────────────────────────────
-  if (days >= STAGNATION_DAYS && Math.abs(pnlPct) < STAGNATION_PCT) {
+  // Crypto positions (Score 10, no thesis window) use tighter thresholds.
+  const isCrypto        = pos.asset_type === 'crypto';
+  const stagDays        = isCrypto ? STAGNATION_DAYS_CRYPTO : STAGNATION_DAYS;
+  const stagPct         = isCrypto ? STAGNATION_PCT_CRYPTO  : STAGNATION_PCT;
+  if (days >= stagDays && Math.abs(pnlPct) < stagPct) {
     const ok = doClose(pos, `stagnation_${daysStr}d_pnl${pnlPct.toFixed(1)}pct`, isoInDays(14));
     if (ok) {
       closed++;
@@ -168,7 +174,7 @@ for (const pos of state.open_positions) {
     const ceiling    = flipEntry?.[opposingSide] ?? 0;
 
     if (ceiling >= FLIP_CEILING_MIN) {
-      const ok = doClose(pos, `direction_flip_opposing_${opposingSide}_ceiling${ceiling}`, isoInDays(21));
+      const ok = doClose(pos, `direction_flip_opposing_${opposingSide}_ceiling${ceiling}`, isoInDays(14));
       if (ok) {
         closed++;
         process.stderr.write(JSON.stringify({ info: 'auto_exit', trigger: 'direction_flip', symbol: pos.symbol, side: pos.side, opposing: opposingSide, ceiling, pnl_pct: +pnlPct.toFixed(2), days_held: daysStr }) + '\n');

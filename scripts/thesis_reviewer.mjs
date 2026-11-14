@@ -12,10 +12,13 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
+
+// Global circuit breaker: file exists → all reviewer API calls skipped until a successful call clears it.
+const AUTH_BLOCK_PATH = join(homedir(), '.claude', 'trading', 'logs', 'reviewer_auth_block.json');
 
 function resolveCredentials() {
   if (process.env.ANTHROPIC_API_KEY) return { apiKey: process.env.ANTHROPIC_API_KEY };
@@ -25,6 +28,20 @@ function resolveCredentials() {
     if (token) return { authToken: token };
   } catch { /* ignore */ }
   return {};
+}
+
+function isAuthBlocked() {
+  return existsSync(AUTH_BLOCK_PATH);
+}
+
+function writeAuthBlock(errMsg) {
+  try {
+    writeFileSync(AUTH_BLOCK_PATH, JSON.stringify({ ts: new Date().toISOString(), error: errMsg }), 'utf8');
+  } catch { /* non-fatal */ }
+}
+
+function clearAuthBlock() {
+  try { if (existsSync(AUTH_BLOCK_PATH)) unlinkSync(AUTH_BLOCK_PATH); } catch { /* non-fatal */ }
 }
 
 const SCRIPTS_DIR  = dirname(fileURLToPath(import.meta.url));
@@ -105,6 +122,14 @@ Decision for ${direction} entry?`;
 
 // --- Call Claude Haiku ---
 async function review() {
+  // Global circuit breaker: skip if any previous auth failure is on record
+  if (isAuthBlocked()) {
+    const result = { approved: false, confidence: 1, reason: 'auth_circuit_open', symbol, score, reviewer_calls: 0, input_tokens: null, output_tokens: null };
+    process.stderr.write(JSON.stringify({ warn: 'thesis_reviewer_auth_blocked', symbol }) + '\n');
+    process.stdout.write(JSON.stringify(result) + '\n');
+    return;
+  }
+
   const client = new Anthropic(resolveCredentials());
   try {
     const msg = await client.messages.create({
@@ -114,7 +139,12 @@ async function review() {
       messages:   [{ role: 'user', content: USER }],
     });
 
+    // Successful call — clear any stale auth block
+    clearAuthBlock();
+
     const raw = msg.content?.[0]?.text?.trim() ?? '';
+    const inputTokens  = msg.usage?.input_tokens  ?? null;
+    const outputTokens = msg.usage?.output_tokens ?? null;
 
     // Extract JSON — handle markdown fences or extra text
     const jsonMatch = raw.match(/\{[^}]+\}/);
@@ -122,17 +152,30 @@ async function review() {
 
     const parsed = JSON.parse(jsonMatch[0]);
     const result = {
-      approved:   Boolean(parsed.approved),
-      confidence: Number(parsed.confidence ?? 5),
-      reason:     String(parsed.reason ?? '').slice(0, 80),
+      approved:       Boolean(parsed.approved),
+      confidence:     Number(parsed.confidence ?? 5),
+      reason:         String(parsed.reason ?? '').slice(0, 80),
       symbol,
       score,
+      reviewer_calls: 1,
+      input_tokens:   inputTokens,
+      output_tokens:  outputTokens,
     };
     process.stderr.write(JSON.stringify({ info: 'thesis_reviewer_result', ...result }) + '\n');
     process.stdout.write(JSON.stringify(result) + '\n');
   } catch (err) {
-    const result = { approved: false, confidence: 1, reason: `api_error: ${err.message?.slice(0, 60) ?? 'unknown'}`, symbol, score };
-    process.stderr.write(JSON.stringify({ warn: 'thesis_reviewer_api_error', error: err.message, symbol }) + '\n');
+    const isAuth = /auth|unauthorized|401|403|invalid.*key|oauth/i.test(err.message ?? '');
+    if (isAuth) {
+      writeAuthBlock(err.message?.slice(0, 120) ?? 'unknown');
+      process.stderr.write(JSON.stringify({ warn: 'thesis_reviewer_auth_error_blocked', error: err.message, symbol }) + '\n');
+    } else {
+      process.stderr.write(JSON.stringify({ warn: 'thesis_reviewer_api_error', error: err.message, symbol }) + '\n');
+    }
+    const result = {
+      approved: false, confidence: 1,
+      reason: `${isAuth ? 'auth_error' : 'api_error'}: ${err.message?.slice(0, 50) ?? 'unknown'}`,
+      symbol, score, reviewer_calls: 1, input_tokens: null, output_tokens: null,
+    };
     process.stdout.write(JSON.stringify(result) + '\n');
   }
 }
