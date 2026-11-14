@@ -194,6 +194,43 @@ if (RUN_SCAN) {
     process.stderr.write(JSON.stringify({ warn: 'mark_to_market_failed', detail: e.message }) + '\n');
   }
 
+  // --- SL enforcement: run portfolio_engine with fresh heatmap prices, no new allocations ---
+  try {
+    const liqPath   = path.join(cacheDir, 'liq_heatmap.json');
+    const statePath = path.join(cwd, 'trading', 'execution', 'portfolio', 'portfolio_state.json');
+    if (fs.existsSync(liqPath) && fs.existsSync(statePath)) {
+      const liq   = JSON.parse(fs.readFileSync(liqPath, 'utf8'));
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      if (Array.isArray(state.open_positions) && state.open_positions.length > 0) {
+        const now = new Date().toISOString();
+        const portfolioMarks = {};
+        for (const [sym, entry] of Object.entries(liq)) {
+          if (entry?.current_price) {
+            portfolioMarks[sym] = { price_usd: entry.current_price, source: 'liq_heatmap', fetched_at: now, available: true };
+          }
+        }
+        const slRunLog = {
+          run_id:            `sl_check_${Date.now()}`,
+          run_at:            now,
+          long_candidates:   [],
+          short_candidates:  [],
+          portfolio_marks:   portfolioMarks,
+        };
+        const tmpDir      = path.join(cwd, 'trading', 'execution', 'tmp');
+        fs.mkdirSync(tmpDir, { recursive: true });
+        const runLogPath  = path.join(tmpDir, `sl_run_log_${Date.now()}.json`);
+        const emptyDecPath = path.join(tmpDir, 'empty_decisions.json');
+        fs.writeFileSync(runLogPath,   JSON.stringify(slRunLog));
+        fs.writeFileSync(emptyDecPath, JSON.stringify([]));
+        const enginePath = path.join(cwd, 'scripts', 'execution', 'portfolio', 'portfolio_engine.mjs');
+        spawnSync(process.execPath, [enginePath, '--run-log', runLogPath, '--decisions', emptyDecPath], { stdio: 'inherit' });
+        try { fs.unlinkSync(runLogPath); } catch {}
+      }
+    }
+  } catch (e) {
+    process.stderr.write(JSON.stringify({ warn: 'sl_engine_error', detail: e.message }) + '\n');
+  }
+
   process.exit(result.status ?? 0);
 }
 
