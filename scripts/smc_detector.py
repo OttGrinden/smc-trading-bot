@@ -59,13 +59,17 @@ SWEEP_MAX_HISTORY    = 80   # how many 4H bars back to search for swing lows (~1
 SWEEP_MAX_BARS_AGO   = 12   # max age of sweep candle: 12 × 4h = 2 days
 SWEEP_EMA_PERIOD     = 50   # EMA period on 4H candles for G2 (≈ 8-day moving avg)
 #
-# G1 for sweep_reversal: pin-bar strength threshold
-#   The sweep candle's close position within its range must be ≥ this value.
-#   close_pos = (close - low) / (high - low): 0 = closed at wick low, 1 = at high
-#   0.50 → close must be in top 50% of range.
-#   Backtest over 300d / 1000 4H bars (BTC/ETH/SOL/BNB/XRP) shows 0.50 maximises
-#   expectancy (+0.43%/trade) when combined with the confluence filter.
+# G1 for sweep_reversal LONG: pin-bar strength threshold (bullish rejection)
+#   close_pos = (close - low) / (high - low): 1 = closed at high
+#   0.50 → close in top 50% of range.
+#   Backtest: 0.50 maximises expectancy (+0.43%/trade, confluence=True, hold=48b).
 SWEEP_G1_PIN_BAR_THRESHOLD = 0.50
+#
+# G1 for sweep_reversal SHORT: bearish pin-bar threshold
+#   close_pos_bear = (high - close) / (high - low): 1 = closed at low
+#   0.70 → close in bottom 30% of range (stronger rejection required for SHORT).
+#   Backtest: 0.70 maximises expectancy (+1.005%/trade, confluence=True, hold=72b).
+SWEEP_G1_PIN_BAR_THRESHOLD_SHORT = 0.70
 
 # ── Sweep-reversal constants (1H path) ────────────────────────────────────────
 # The 1H detector sweeps 4H pivot lows (not daily) — captures intraday structure.
@@ -666,9 +670,10 @@ def detect_sweep_reversal_4h_short(
             g6 = cj['close'] < cj['open']
 
             # G1: Bearish pin-bar — close near the LOW of the sweep candle = strong rejection
+            # Threshold 0.70 (backtest-calibrated for SHORT; higher than LONG's 0.50)
             candle_range   = cj['high'] - cj['low']
             close_pos_bear = (cj['high'] - cj['close']) / candle_range if candle_range > 0 else 0.0
-            g1             = close_pos_bear >= SWEEP_G1_PIN_BAR_THRESHOLD
+            g1             = close_pos_bear >= SWEEP_G1_PIN_BAR_THRESHOLD_SHORT
 
             # G7: R/R ≥ 1:2 (SHORT) — SL above wick, TP = lowest low in prior 50 bars
             sl_level     = cj['high'] * 1.002
@@ -779,7 +784,7 @@ def detect_sweep_reversal_1h_short(
 
             candle_range   = cj['high'] - cj['low']
             close_pos_bear = (cj['high'] - cj['close']) / candle_range if candle_range > 0 else 0.0
-            g1             = close_pos_bear >= SWEEP_G1_PIN_BAR_THRESHOLD
+            g1             = close_pos_bear >= SWEEP_G1_PIN_BAR_THRESHOLD_SHORT
 
             sl_level     = cj['high'] * 1.002
             sl_dist      = sl_level - current_price
