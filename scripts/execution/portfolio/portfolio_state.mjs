@@ -235,8 +235,16 @@ export function backfillSectors(state) {
   for (const pos of state.open_positions ?? []) {
     if (pos.sector != null) { result.already += 1; continue; }
     const sec = symbolToSector.get(pos.symbol);
-    if (sec != null) { pos.sector = sec; result.filled.push(pos.symbol); }
-    else             { result.unresolved.push(pos.symbol); }
+    if (sec != null) {
+      pos.sector = sec; result.filled.push(pos.symbol);
+    } else if (pos.asset_type === 'crypto') {
+      // Crypto symbols are not in the stocks registry — assign individual sub-sectors
+      // so sector_exposure_cap and sector-ban logic work correctly per symbol.
+      pos.sector = `crypto_${pos.symbol.toLowerCase()}`;
+      result.filled.push(pos.symbol);
+    } else {
+      result.unresolved.push(pos.symbol);
+    }
   }
   return result;
 }

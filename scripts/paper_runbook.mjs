@@ -66,27 +66,25 @@ if (posAge === null || posAge > 100 / 60) {
 }
 
 // --- Portfolio history ---
-const histCandidates = [
-  path.join(cwd, 'portfolio_history.jsonl'),
-  path.join(cwd, 'trading', 'execution', 'portfolio', 'portfolio_history.jsonl'),
+const ledgerCandidates = [
+  path.join(cwd, 'trade_ledger.jsonl'),
+  path.join(cwd, 'trading', 'execution', 'portfolio', 'trade_ledger.jsonl'),
 ];
-const histPath = histCandidates.find(p => fs.existsSync(p)) ?? histCandidates[0];
-const history = readJsonl(histPath);
+const ledgerPath = ledgerCandidates.find(p => fs.existsSync(p)) ?? ledgerCandidates[0];
+const ledger = readJsonl(ledgerPath);
 
 const cutoff = Date.now() - 7 * 24 * 3_600_000;
 
-const smc7d = history.filter(e =>
-  e?.event === 'trade_opened' &&
-  typeof e?.reason === 'string' &&
-  e.reason.includes('SMC_') &&
-  new Date(e.timestamp).getTime() >= cutoff
+const smc7d = ledger.filter(e =>
+  e?.event === 'open' &&
+  new Date(e.ts ?? e.timestamp).getTime() >= cutoff
 ).length;
 
-const pnl7d = history
+const pnl7d = ledger
   .filter(e =>
-    e?.event === 'trade_closed' &&
+    (e?.event === 'close' || e?.event === 'partial_close') &&
     typeof e?.realized_pnl_eur === 'number' &&
-    new Date(e.timestamp).getTime() >= cutoff
+    new Date(e.ts ?? e.timestamp).getTime() >= cutoff
   )
   .reduce((s, e) => s + e.realized_pnl_eur, 0);
 
@@ -173,11 +171,15 @@ if (RUN_SCAN) {
           updated = true;
         }
         if (updated) {
-          // Recompute portfolio-level unrealized PnL and NAV
+          // Recompute portfolio-level unrealized PnL, gross_exposure and NAV
           const totalUnrealized = state.open_positions
             .reduce((s, p) => s + (p.unrealized_pnl_eur ?? 0), 0);
-          state.unrealized_pnl = +totalUnrealized.toFixed(4);
-          state.equity_nav     = +(state.cash + state.gross_exposure + totalUnrealized).toFixed(4);
+          const totalNotional = state.open_positions
+            .reduce((s, p) => s + (p.notional_eur ?? 0), 0);
+          state.unrealized_pnl  = +totalUnrealized.toFixed(4);
+          state.gross_exposure  = +(totalNotional + totalUnrealized).toFixed(4);
+          state.net_exposure    = state.gross_exposure;
+          state.equity_nav      = +(state.cash + totalNotional + totalUnrealized).toFixed(4);
           state.last_updated_at = now;
           fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
           process.stderr.write(JSON.stringify({

@@ -36,7 +36,7 @@ OHLCV_PATH = str(_BASE / 'trading' / 'cache' / 'ohlcv_daily_BTC.json')
 FNG_URL    = 'https://api.alternative.me/fng/?limit=1&format=json'
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-FNG_LOW     = 20     # below  → extreme fear  → RED
+FNG_LOW     = 10     # below  → extreme fear  → RED (10 = absolute panic; oversold bounces still valid)
 FNG_HIGH    = 80     # above  → extreme greed → RED
 ATR_PERIOD  = 14
 ATR_MIN_PCT = 0.015  # 1.5% of current price
