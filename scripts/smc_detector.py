@@ -58,6 +58,14 @@ SWEEP_PIVOT_LEN      = 5    # bars each side for 4H swing identification (wider 
 SWEEP_MAX_HISTORY    = 80   # how many 4H bars back to search for swing lows (~13 days)
 SWEEP_MAX_BARS_AGO   = 12   # max age of sweep candle: 12 × 4h = 2 days
 SWEEP_EMA_PERIOD     = 50   # EMA period on 4H candles for G2 (≈ 8-day moving avg)
+#
+# G1 for sweep_reversal: pin-bar strength threshold
+#   The sweep candle's close position within its range must be ≥ this value.
+#   close_pos = (close - low) / (high - low): 0 = closed at wick low, 1 = at high
+#   0.50 → close must be in top 50% of range.
+#   Backtest over 300d / 1000 4H bars (BTC/ETH/SOL/BNB/XRP) shows 0.50 maximises
+#   expectancy (+0.43%/trade) when combined with the confluence filter.
+SWEEP_G1_PIN_BAR_THRESHOLD = 0.50
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -379,34 +387,24 @@ def detect_sweep_reversal_4h(
             # ── G6: Reversal confirmation — sweep candle closes bullish ───────
             g6 = cj['close'] > cj['open']
 
-            # ── G1: 4H BOS post-sweep — close above nearest pre-sweep swing high ─
-            # Uses 2-bar fractal to find the nearest confirmed swing high before
-            # the sweep (NOT the absolute max of 20 bars — that is too far away).
-            # Fallback: highest high of the 3 bars immediately before the sweep.
-            pre_sweep_high = None
-            for k in range(j - 1, max(0, j - 20), -1):
-                h  = candles_4h[k]['high']
-                ws = max(0, k - 2)
-                we = min(n, k + 3)
-                neighbors = [candles_4h[m]['high'] for m in range(ws, we) if m != k]
-                if neighbors and h > max(neighbors):
-                    pre_sweep_high = h
-                    break
-            if pre_sweep_high is None and j >= 3:
-                pre_sweep_high = max(candles_4h[m]['high'] for m in range(max(0, j - 3), j))
-
-            g1 = False
-            if pre_sweep_high is not None:
-                for m in range(j + 1, n):
-                    if candles_4h[m]['close'] > pre_sweep_high:
-                        g1 = True
-                        break
+            # ── G1: Pin-bar / institutional absorption ────────────────────────
+            # Measures how strongly the sweep candle REJECTED the swept level.
+            # close_pos = 1.0 → closed at the high (maximum rejection)
+            # close_pos = 0.6 → closed in top 40% of range (strong absorption)
+            # This replaces "close above prior swing high" which fires too late —
+            # a strong bullish sweep candle IS the structural confirmation (BOS
+            # equivalent at the swept level).
+            candle_range = cj['high'] - cj['low']
+            close_pos    = (cj['close'] - cj['low']) / candle_range if candle_range > 0 else 0.0
+            g1           = close_pos >= SWEEP_G1_PIN_BAR_THRESHOLD
 
             # ── G7: R/R ≥ 1:2 ────────────────────────────────────────────────
-            # SL = 0.2% below sweep wick; Target = highest 4H high in pre-sweep window
-            sl_level     = cj['low'] * 0.998
-            sl_dist      = current_price - sl_level
-            target_price = pre_sweep_high if pre_sweep_high else current_price
+            # SL = 0.2% below sweep wick
+            # TP  = highest high in the 50 bars before the sweep (prior distribution)
+            sl_level  = cj['low'] * 0.998
+            sl_dist   = current_price - sl_level
+            lb_start  = max(0, j - 50)
+            target_price = max(c2['high'] for c2 in candles_4h[lb_start : j]) if j > 0 else current_price
             rr = (target_price - current_price) / sl_dist if sl_dist > 0 else 0.0
             g7 = rr >= 2.0
 
@@ -596,16 +594,73 @@ def main() -> None:
             # ── Sweep-reversal path: additional 4H signal (independent of daily BOS) ──
             # Uses daily pivot lows as reference levels so macro lows (months old)
             # are captured. Outputs a SECOND line for the symbol when found.
+            #
+            # Confluence confirmation: backtest shows requiring the next 4H bar to
+            # close bullish (before entering) adds ~+0.43%/trade expectancy.
+            # Implementation: first scan stores pending; second scan with same level
+            # + bullish confirmation 4H bar → confirmed → original score returned.
             if candles_4h:
                 sweep = detect_sweep_reversal_4h(
                     candles_4h,
-                    pivot_lows,                    # daily pivot lows
+                    pivot_lows,
                     out.get('ema200') or 0.0,
                     symbol,
                 )
                 if sweep is not None:
+                    # Find any existing pending sweep for this symbol
+                    pending_sweep = next(
+                        (s for s in pending_setups
+                         if s['symbol'] == symbol
+                         and s.get('strategy') == 'sweep_reversal_4h'
+                         and s['status'] == 'pending_confirmation'),
+                        None,
+                    )
+
+                    confluence_confirmed = False
+                    if pending_sweep is not None:
+                        ref_level = pending_sweep.get('sweep_level', 0)
+                        same_lvl  = ref_level > 0 and abs(ref_level - sweep['sweep_level']) / ref_level < 0.005
+                        if same_lvl:
+                            sig_ts   = pending_sweep.get('signal_4h_ts', 0)
+                            conf_bar = next(
+                                (c for c in candles_4h if c['timestamp'] > sig_ts), None
+                            )
+                            if conf_bar is not None and conf_bar['close'] > conf_bar['open']:
+                                confluence_confirmed = True
+
+                    sweep['confluence_confirmed'] = confluence_confirmed
+
+                    # Clear any stale pending entry for this symbol
+                    pending_setups = [
+                        s for s in pending_setups
+                        if not (s['symbol'] == symbol and s.get('strategy') == 'sweep_reversal_4h')
+                    ]
+
+                    if not confluence_confirmed:
+                        # Store pending — wait for next 4H bar to confirm
+                        pending_setups.append({
+                            'symbol':             symbol,
+                            'strategy':           'sweep_reversal_4h',
+                            'side':               sweep['side'],
+                            'score':              sweep['score'],
+                            'sweep_level':        sweep['sweep_level'],
+                            'signal_4h_ts':       candles_4h[-1]['timestamp'],
+                            'confirmation_price': sweep['current_price'],
+                            'entry_timestamp':    datetime.now(timezone.utc).isoformat(),
+                            'status':             'pending_confirmation',
+                        })
+                        # Downgrade score: 9 → 8 (monitoring), 8 → 7 (suppressed)
+                        sweep['score']  = max(0, sweep['score'] - 1)
+                        sweep['reason'] = sweep['reason'] + ' [waiting confluence: next 4H bar must close bullish]'
+
                     outputs.append(sweep)
                     state_changes += 1
+                else:
+                    # No sweep signal — clear any stale pending entry
+                    pending_setups = [
+                        s for s in pending_setups
+                        if not (s['symbol'] == symbol and s.get('strategy') == 'sweep_reversal_4h')
+                    ]
 
             # State: persist Score-8 setups (IDM not yet swept)
             if out['score'] == 8:

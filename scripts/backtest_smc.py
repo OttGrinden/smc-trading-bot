@@ -8,16 +8,13 @@ Fetches historical OHLCV from Binance public API (no auth needed):
 
 Runs for each 4H bar (after warmup):
   - detect_sweep_reversal_4h  (new: sell-side sweep + reversal LONG)
-  - detect_setup (existing:   BOS + EMA200 + IDM — both directions)
-
-Entry: open of next 4H bar after signal
-Exit:  first bar whose low ≤ SL  or  high ≥ TP  (or timeout at --max-bars)
 
 Usage:
-  python scripts/backtest_smc.py
-  python scripts/backtest_smc.py --symbol ETH
-  python scripts/backtest_smc.py --symbol BTC --tp-rr 2.5 --max-bars 48
-  python scripts/backtest_smc.py --symbol BTC --all-symbols
+  python scripts/backtest_smc.py                                 # BTC single run
+  python scripts/backtest_smc.py --symbol ETH --tp-rr 2.5
+  python scripts/backtest_smc.py --all-symbols
+  python scripts/backtest_smc.py --param-sweep                   # full grid search
+  python scripts/backtest_smc.py --param-sweep --all-symbols     # grid on all symbols
 """
 
 from __future__ import annotations
@@ -36,12 +33,10 @@ _spec = importlib.util.spec_from_file_location('smc_detector', _HERE / 'smc_dete
 _mod  = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-find_pivots          = _mod.find_pivots
-detect_setup         = _mod.detect_setup
+find_pivots              = _mod.find_pivots
 detect_sweep_reversal_4h = _mod.detect_sweep_reversal_4h
-calc_ema             = _mod.calc_ema
-_ema                 = _mod._ema
-EMA_PERIOD           = _mod.EMA_PERIOD
+calc_ema                 = _mod.calc_ema
+EMA_PERIOD               = _mod.EMA_PERIOD
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BINANCE_KLINES = 'https://api.binance.com/api/v3/klines'
@@ -49,95 +44,89 @@ ALL_SYMBOLS    = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP']
 DEFAULT_SYMBOL = 'BTC'
 DAILY_LIMIT    = 300    # ~10 months
 H4_LIMIT       = 1000   # ~5.5 months
-WARMUP_DAILY   = 210    # need 200 for EMA200 + 10 for pivots
-WARMUP_H4      = 60     # bars needed before first sweep check
+WARMUP_DAILY   = 210    # 200 for EMA200 + 10 for pivots
+WARMUP_H4      = 60     # bars before first sweep check
+
+# ── Parameter sweep grid ──────────────────────────────────────────────────────
+PARAM_PIN_BAR   = [0.50, 0.55, 0.60, 0.65, 0.70]
+PARAM_TP_RR     = [1.5,  2.0,  2.5,  3.0]
+PARAM_MAX_BARS  = [24,   48,   72]
+# Confluence filter: require next 4H candle after sweep to also close bullish
+# (proxy for heatmap buy-pressure confirmation — buyers follow through)
+PARAM_CONFLUENCE = [False, True]
 
 # ── Fetch from Binance ────────────────────────────────────────────────────────
 
+_cache: dict = {}   # {symbol+interval: candles}  — reuse across runs
+
 def fetch_binance(symbol: str, interval: str, limit: int) -> list:
+    key = f'{symbol}_{interval}'
+    if key in _cache:
+        return _cache[key]
     pair = symbol.upper() + 'USDT'
     url  = f'{BINANCE_KLINES}?symbol={pair}&interval={interval}&limit={limit}'
     try:
-        with urllib.request.urlopen(url, timeout=15) as r:
+        with urllib.request.urlopen(url, timeout=20) as r:
             raw = json.loads(r.read())
     except Exception as e:
         print(f'[fetch_error] {symbol} {interval}: {e}', file=sys.stderr)
         return []
-    return [
-        {
-            'timestamp': row[0],
-            'open':      float(row[1]),
-            'high':      float(row[2]),
-            'low':       float(row[3]),
-            'close':     float(row[4]),
-            'volume':    float(row[5]),
-        }
+    candles = [
+        {'timestamp': row[0], 'open': float(row[1]), 'high': float(row[2]),
+         'low': float(row[3]), 'close': float(row[4]), 'volume': float(row[5])}
         for row in raw
     ]
+    _cache[key] = candles
+    return candles
 
 
 # ── Exit simulation ───────────────────────────────────────────────────────────
 
-def simulate_exit(candles_4h: list, entry_bar: int, entry_price: float,
+def simulate_exit(candles: list, entry_bar: int, entry: float,
                   sl: float, tp: float, max_bars: int) -> dict:
-    """
-    Scan forward from entry_bar.  Returns outcome dict.
-    SL and TP are checked intra-bar (worst case: SL wins if both hit same bar).
-    """
-    for i in range(entry_bar, min(entry_bar + max_bars, len(candles_4h))):
-        c = candles_4h[i]
+    """Scan forward; SL wins when both hit on same bar (conservative)."""
+    n = len(candles)
+    for i in range(entry_bar, min(entry_bar + max_bars, n)):
+        c = candles[i]
         sl_hit = c['low']  <= sl
         tp_hit = c['high'] >= tp
         if sl_hit or tp_hit:
-            if sl_hit and tp_hit:
-                # Ambiguous — assume SL hit first (conservative)
-                result = 'sl'
-                exit_price = sl
-            elif sl_hit:
-                result = 'sl'
-                exit_price = sl
-            else:
-                result = 'tp'
-                exit_price = tp
-            pnl_pct = (exit_price - entry_price) / entry_price * 100
-            return {
-                'result':     result,
-                'exit_bar':   i,
-                'bars_held':  i - entry_bar,
-                'exit_price': round(exit_price, 4),
-                'pnl_pct':    round(pnl_pct, 3),
-            }
-    # Timeout — close at last bar
-    close_price = candles_4h[min(entry_bar + max_bars - 1, len(candles_4h) - 1)]['close']
-    pnl_pct     = (close_price - entry_price) / entry_price * 100
-    return {
-        'result':     'timeout',
-        'exit_bar':   entry_bar + max_bars,
-        'bars_held':  max_bars,
-        'exit_price': round(close_price, 4),
-        'pnl_pct':    round(pnl_pct, 3),
-    }
+            result     = 'sl' if sl_hit else 'tp'
+            exit_price = sl if sl_hit else tp
+            return {'result': result, 'bars_held': i - entry_bar,
+                    'pnl_pct': round((exit_price - entry) / entry * 100, 3)}
+    close = candles[min(entry_bar + max_bars - 1, n - 1)]['close']
+    return {'result': 'timeout', 'bars_held': max_bars,
+            'pnl_pct': round((close - entry) / entry * 100, 3)}
 
 
-# ── Sweep backtest ────────────────────────────────────────────────────────────
+# ── Core sweep backtest ───────────────────────────────────────────────────────
 
-def backtest_sweep(symbol: str, candles_daily: list, candles_4h: list,
-                   tp_rr: float, max_bars: int) -> list:
+def run_sweep_backtest(
+    symbol: str, candles_daily: list, candles_4h: list,
+    pin_bar_threshold: float, tp_rr: float, max_bars: int,
+    require_confluence: bool = False,
+) -> list:
     """
-    For each 4H bar j (after warmup), run detect_sweep_reversal_4h on
-    candles_4h[:j+1] and daily_candles up to same date.
-    Return list of trade dicts.
+    Sliding-window sweep_reversal_4h backtest.
+
+    pin_bar_threshold  : G1 close_pos cutoff (0.50–0.70)
+    tp_rr              : take-profit as multiple of SL distance
+    max_bars           : max 4H bars to hold before timeout exit
+    require_confluence : True → next candle after sweep must also close bullish
+                         (proxy for heatmap buy-pressure confirmation)
     """
-    trades    = []
-    last_entry_bar = -99   # prevent duplicate entries within 12 bars
+    # Temporarily patch the module constant for this run
+    _mod.SWEEP_G1_PIN_BAR_THRESHOLD = pin_bar_threshold
+
+    trades         = []
+    last_entry_bar = -99
 
     for j in range(WARMUP_H4, len(candles_4h) - 1):
-        # Skip if recently entered a sweep trade (avoid re-entry on same sweep)
-        if j - last_entry_bar < 12:
+        if j - last_entry_bar < 12:  # cooldown: no re-entry within same sweep window
             continue
 
-        ts_4h = candles_4h[j]['timestamp']
-        # Align daily slice to same timestamp
+        ts_4h       = candles_4h[j]['timestamp']
         daily_slice = [c for c in candles_daily if c['timestamp'] <= ts_4h]
         if len(daily_slice) < WARMUP_DAILY:
             continue
@@ -146,217 +135,203 @@ def backtest_sweep(symbol: str, candles_daily: list, candles_4h: list,
         if not piv_lows:
             continue
 
-        h4_slice    = candles_4h[:j + 1]
-        ema200      = calc_ema([c['close'] for c in daily_slice])
+        h4_slice = candles_4h[:j + 1]
+        ema200   = calc_ema([c['close'] for c in daily_slice])
 
         sig = detect_sweep_reversal_4h(h4_slice, piv_lows, ema200, symbol)
-        if sig is None or sig['score'] < 7:   # output even Score 7 for analysis
+        if sig is None or sig['score'] < 7:
             continue
 
-        entry_bar   = j + 1
+        # Confluence filter: bar j+1 must close bullish → enter at open of j+2 (no lookahead).
+        # In live system: scan sees sweep at bar j, waits 4H for j+1 to close, enters j+2 open.
+        if require_confluence:
+            confirm_bar = j + 1
+            if confirm_bar >= len(candles_4h):
+                continue
+            if candles_4h[confirm_bar]['close'] <= candles_4h[confirm_bar]['open']:
+                continue
+            entry_bar = j + 2
+        else:
+            entry_bar = j + 1
+
+        if entry_bar >= len(candles_4h):
+            continue
+
         entry_price = candles_4h[entry_bar]['open']
-        sl          = sig['sl_level']
-        sl_dist     = entry_price - sl
+        sl_dist     = entry_price - sig['sl_level']
         if sl_dist <= 0:
             continue
         tp = entry_price + sl_dist * tp_rr
 
-        outcome = simulate_exit(candles_4h, entry_bar, entry_price, sl, tp, max_bars)
-
-        trade = {
+        outcome = simulate_exit(candles_4h, entry_bar, entry_price,
+                                sig['sl_level'], tp, max_bars)
+        trades.append({
             'symbol':       symbol,
-            'strategy':     'sweep_reversal_4h',
             'score':        sig['score'],
-            'signal_bar':   j,
             'signal_ts':    datetime.fromtimestamp(ts_4h / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
-            'sweep_level':  sig['sweep_level'],
             'entry_price':  round(entry_price, 4),
-            'sl':           round(sl, 4),
+            'sl':           round(sig['sl_level'], 4),
             'tp':           round(tp, 4),
-            'rr_target':    tp_rr,
+            'sweep_level':  sig['sweep_level'],
+            'g1_pin':       sig.get('g1_bos_4h', False),
+            'g2_ema':       sig.get('g2_ema50_4h', False),
             **outcome,
-        }
-        trades.append(trade)
+        })
         last_entry_bar = entry_bar
 
     return trades
 
 
-# ── Existing detector backtest ────────────────────────────────────────────────
+# ── Summary helpers ───────────────────────────────────────────────────────────
 
-def backtest_smc_detector(symbol: str, candles_daily: list, candles_4h: list,
-                           tp_rr: float, max_bars: int) -> list:
-    """
-    For each daily bar i (after warmup), run detect_setup.
-    Signal fires when score transitions to ≥ 9.
-    Entry: open of first 4H bar on the same date.
-    """
-    trades         = []
-    prev_score     = 0
-    prev_side      = None
-    last_entry_bar = -99
+def trade_stats(trades: list) -> dict:
+    if not trades:
+        return {'n': 0, 'wr': 0.0, 'avg_pnl': 0.0, 'expectancy': 0.0}
+    wins = sum(1 for t in trades if t['result'] == 'tp')
+    wr   = wins / len(trades) * 100
+    avg  = sum(t['pnl_pct'] for t in trades) / len(trades)
+    return {'n': len(trades), 'wr': round(wr, 1), 'avg_pnl': round(avg, 3),
+            'expectancy': round(avg * len(trades), 2)}
 
-    for i in range(WARMUP_DAILY, len(candles_daily) - 1):
-        daily_slice = candles_daily[:i + 1]
-        ts_daily    = candles_daily[i]['timestamp']
-
-        # 4H price at same time
-        h4_at_time = [c for c in candles_4h if c['timestamp'] <= ts_daily]
-        price_4h   = h4_at_time[-1]['close'] if h4_at_time else None
-
-        try:
-            sig = detect_setup(daily_slice, symbol, price_4h)
-        except Exception:
-            continue
-
-        score = sig.get('score', 0)
-        side  = sig.get('side')
-
-        # Fire on fresh Score ≥ 9 (transition from < 9 or direction change)
-        if score >= 9 and (prev_score < 9 or side != prev_side):
-            # Find first 4H bar on the next daily close date
-            next_ts = candles_daily[i + 1]['timestamp']
-            h4_candidates = [
-                (k, c) for k, c in enumerate(candles_4h)
-                if c['timestamp'] >= ts_daily and c['timestamp'] < next_ts
-            ]
-            if not h4_candidates:
-                prev_score, prev_side = score, side
-                continue
-
-            entry_4h_idx = h4_candidates[0][0]
-            if entry_4h_idx - last_entry_bar < 6:
-                prev_score, prev_side = score, side
-                continue
-
-            entry_price = candles_4h[entry_4h_idx]['open']
-            sl_pct      = sig.get('idm_level') or 0
-            # Use OTE zone as SL anchor: origin_level as absolute SL
-            origin      = sig.get('origin_level') or 0
-            if side == 'long':
-                sl = origin * 0.998
-                if sl >= entry_price:
-                    prev_score, prev_side = score, side
-                    continue
-            else:
-                sl = origin * 1.002
-                if sl <= entry_price:
-                    prev_score, prev_side = score, side
-                    continue
-
-            sl_dist = abs(entry_price - sl)
-            if sl_dist <= 0:
-                prev_score, prev_side = score, side
-                continue
-
-            tp = entry_price + sl_dist * tp_rr * (1 if side == 'long' else -1)
-
-            # For short, invert simulate_exit (flip candle high/low)
-            if side == 'short':
-                inv_4h = [
-                    {**c, 'high': -c['low'], 'low': -c['high'], 'open': -c['open'], 'close': -c['close']}
-                    for c in candles_4h
-                ]
-                outcome = simulate_exit(inv_4h, entry_4h_idx, -entry_price, -sl, -tp, max_bars)
-                outcome['pnl_pct'] = -outcome['pnl_pct']
-                outcome['exit_price'] = -outcome['exit_price']
-            else:
-                outcome = simulate_exit(candles_4h, entry_4h_idx, entry_price, sl, tp, max_bars)
-
-            trade = {
-                'symbol':       symbol,
-                'strategy':     f'smc_detector_{side}',
-                'score':        score,
-                'signal_bar':   i,
-                'signal_ts':    datetime.fromtimestamp(ts_daily / 1000, tz=timezone.utc).strftime('%Y-%m-%d'),
-                'h1_level':     sig.get('h1_level'),
-                'idm_level':    sig.get('idm_level'),
-                'entry_price':  round(entry_price, 4),
-                'sl':           round(sl, 4),
-                'tp':           round(tp, 4),
-                'rr_target':    tp_rr,
-                **outcome,
-            }
-            trades.append(trade)
-            last_entry_bar = entry_4h_idx
-
-        prev_score, prev_side = score, side
-
-    return trades
-
-
-# ── Summary printer ───────────────────────────────────────────────────────────
 
 def print_summary(trades: list, label: str) -> None:
     if not trades:
-        print(f'\n{label}: 0 trades — no signals fired')
+        print(f'\n{label}: 0 trades')
         return
-
-    wins     = [t for t in trades if t['result'] == 'tp']
-    losses   = [t for t in trades if t['result'] == 'sl']
-    timeouts = [t for t in trades if t['result'] == 'timeout']
-    total    = len(trades)
-    wr       = len(wins) / total * 100
-    avg_pnl  = sum(t['pnl_pct'] for t in trades) / total
-    total_pnl = sum(t['pnl_pct'] for t in trades)
-    avg_bars = sum(t['bars_held'] for t in trades) / total
-
-    print(f'\n{"-"*60}')
+    s = trade_stats(trades)
+    wins     = sum(1 for t in trades if t['result'] == 'tp')
+    losses   = sum(1 for t in trades if t['result'] == 'sl')
+    timeouts = sum(1 for t in trades if t['result'] == 'timeout')
+    avg_bars = sum(t['bars_held'] for t in trades) / len(trades)
+    print(f'\n{"-"*62}')
     print(f' {label}')
-    print(f'{"-"*60}')
-    print(f'  Trades   : {total}  (TP:{len(wins)}  SL:{len(losses)}  Timeout:{len(timeouts)})')
-    print(f'  Win rate : {wr:.1f}%')
-    print(f'  Avg PnL  : {avg_pnl:+.2f}% per trade')
-    print(f'  Total PnL: {total_pnl:+.2f}% (sum of all trades)')
-    print(f'  Avg hold : {avg_bars:.1f} 4H bars ({avg_bars * 4 / 24:.1f} days)')
+    print(f'{"-"*62}')
+    print(f'  Trades   : {s["n"]}  (TP:{wins}  SL:{losses}  Timeout:{timeouts})')
+    print(f'  Win rate : {s["wr"]}%   (break-even at 2:1 = 33.3%)')
+    print(f'  Avg PnL  : {s["avg_pnl"]:+.3f}% per trade')
+    print(f'  Avg hold : {avg_bars:.1f} bars ({avg_bars * 4 / 24:.1f} days)')
+    for sc in sorted(set(t['score'] for t in trades)):
+        sub = [t for t in trades if t['score'] == sc]
+        sw  = sum(1 for t in sub if t['result'] == 'tp')
+        print(f'    Score {sc}: {len(sub)} trades  WR={sw/len(sub)*100:.0f}%  avg={sum(t["pnl_pct"] for t in sub)/len(sub):+.2f}%')
     print()
+    print('  Last 8 trades:')
+    for t in trades[-8:]:
+        mk = 'TP' if t['result'] == 'tp' else ('SL' if t['result'] == 'sl' else '--')
+        print(f'    {t["signal_ts"]}  entry={t["entry_price"]}  {mk}  {t["pnl_pct"]:+.2f}%  {t["bars_held"]}bars')
 
-    # Score breakdown
-    for s in sorted(set(t['score'] for t in trades)):
-        st = [t for t in trades if t['score'] == s]
-        sw = [t for t in st if t['result'] == 'tp']
-        print(f'  Score {s}: {len(st)} trades  WR={len(sw)/len(st)*100:.0f}%  avg={sum(t["pnl_pct"] for t in st)/len(st):+.2f}%')
 
-    print()
-    print('  Last 10 trades:')
-    for t in trades[-10:]:
-        mark = 'TP' if t['result']=='tp' else ('SL' if t['result']=='sl' else '—')
-        print(f'    {t["signal_ts"]}  entry={t["entry_price"]}  {mark}  {t["pnl_pct"]:+.2f}%  {t["bars_held"]}bars')
+# ── Parameter sweep ───────────────────────────────────────────────────────────
+
+def run_param_sweep(symbols: list) -> None:
+    print('\nFetching data for all symbols…')
+    data = {}
+    for sym in symbols:
+        d = fetch_binance(sym, '1d', DAILY_LIMIT)
+        h = fetch_binance(sym, '4h', H4_LIMIT)
+        if len(d) >= WARMUP_DAILY + 10 and len(h) >= WARMUP_H4 + 10:
+            data[sym] = (d, h)
+            print(f'  {sym}: {len(d)}d / {len(h)}h bars')
+
+    results = []
+    total   = len(PARAM_PIN_BAR) * len(PARAM_TP_RR) * len(PARAM_MAX_BARS) * len(PARAM_CONFLUENCE)
+    done    = 0
+
+    print(f'\nRunning {total} parameter combinations…')
+
+    for pin in PARAM_PIN_BAR:
+        for rr in PARAM_TP_RR:
+            for mb in PARAM_MAX_BARS:
+                for conf in PARAM_CONFLUENCE:
+                    all_trades = []
+                    for sym, (daily, h4) in data.items():
+                        t = run_sweep_backtest(sym, daily, h4, pin, rr, mb, conf)
+                        all_trades.extend(t)
+                    s = trade_stats(all_trades)
+                    results.append({
+                        'pin_bar': pin, 'tp_rr': rr, 'max_bars': mb, 'confluence': conf,
+                        **s,
+                    })
+                    done += 1
+                    if done % 20 == 0:
+                        print(f'  {done}/{total}…')
+
+    # Sort by avg_pnl descending (best expectancy)
+    results.sort(key=lambda r: r['avg_pnl'], reverse=True)
+
+    print(f'\n{"="*72}')
+    print(' PARAMETER SWEEP RESULTS — sorted by avg PnL per trade')
+    print(f'{"="*72}')
+    print(f'  {"pin":>5}  {"rr":>5}  {"hold":>5}  {"conf":>5}  {"n":>5}  {"WR%":>6}  {"avgPnL":>8}  {"expect":>8}')
+    print(f'  {"-"*5}  {"-"*5}  {"-"*5}  {"-"*5}  {"-"*5}  {"-"*6}  {"-"*8}  {"-"*8}')
+
+    for r in results[:20]:
+        c = 'Y' if r['confluence'] else 'N'
+        marker = '  <-- BEST' if r == results[0] else ''
+        print(
+            f'  {r["pin_bar"]:.2f}  {r["tp_rr"]:.1f}x  {r["max_bars"]:>3}b'
+            f'  {c:>5}  {r["n"]:>5}  {r["wr"]:>5.1f}%  {r["avg_pnl"]:>+7.3f}%'
+            f'  {r["expectancy"]:>+7.1f}%{marker}'
+        )
+
+    best = results[0]
+    print(f'\n  Best config: pin_bar={best["pin_bar"]}  tp_rr={best["tp_rr"]}  '
+          f'max_bars={best["max_bars"]}  confluence={best["confluence"]}')
+    print(f'  Trades={best["n"]}  WR={best["wr"]}%  avgPnL={best["avg_pnl"]:+.3f}%  '
+          f'expectancy={best["expectancy"]:+.1f}%')
+
+    # Apply best config to live smc_detector
+    _mod.SWEEP_G1_PIN_BAR_THRESHOLD = best['pin_bar']
+    print(f'\n  Applied best pin_bar_threshold={best["pin_bar"]} to live smc_detector module.')
+    print(f'  To persist: update SWEEP_G1_PIN_BAR_THRESHOLD in scripts/smc_detector.py')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--symbol',      default=DEFAULT_SYMBOL, help='Symbol (BTC/ETH/SOL/…)')
-    ap.add_argument('--all-symbols', action='store_true',    help='Run all SMC_SYMBOLS')
-    ap.add_argument('--tp-rr',       type=float, default=2.0, help='Take-profit R/R (default 2.0)')
-    ap.add_argument('--max-bars',    type=int,   default=48,  help='Max bars to hold (default 48 = 8 days)')
-    ap.add_argument('--json',        action='store_true',    help='Output all trades as JSON')
+    ap.add_argument('--symbol',       default=DEFAULT_SYMBOL)
+    ap.add_argument('--all-symbols',  action='store_true')
+    ap.add_argument('--tp-rr',        type=float, default=2.0)
+    ap.add_argument('--max-bars',     type=int,   default=48)
+    ap.add_argument('--pin-bar',      type=float, default=None,
+                    help='Override G1 pin-bar threshold (default: use smc_detector.py value)')
+    ap.add_argument('--confluence',   action='store_true',
+                    help='Require next candle after sweep to close bullish (heatmap proxy)')
+    ap.add_argument('--param-sweep',  action='store_true',
+                    help='Grid search over all parameter combinations')
+    ap.add_argument('--json',         action='store_true')
     args = ap.parse_args()
 
     symbols = ALL_SYMBOLS if args.all_symbols else [args.symbol.upper()]
 
+    if args.param_sweep:
+        run_param_sweep(symbols)
+        return
+
     all_trades: list = []
 
     for sym in symbols:
-        print(f'\nFetching {sym} from Binance…', end=' ', flush=True)
+        print(f'Fetching {sym}…', end=' ', flush=True)
         daily = fetch_binance(sym, '1d', DAILY_LIMIT)
         h4    = fetch_binance(sym, '4h', H4_LIMIT)
-        print(f'{len(daily)} daily bars, {len(h4)} 4H bars')
+        print(f'{len(daily)}d / {len(h4)}h bars')
 
         if len(daily) < WARMUP_DAILY + 10 or len(h4) < WARMUP_H4 + 10:
-            print(f'  [skip] insufficient data for {sym}')
+            print(f'  [skip] not enough data')
             continue
 
-        sweep_trades = backtest_sweep(sym, daily, h4, args.tp_rr, args.max_bars)
-        smc_trades   = backtest_smc_detector(sym, daily, h4, args.tp_rr, args.max_bars)
+        pin = args.pin_bar if args.pin_bar is not None else _mod.SWEEP_G1_PIN_BAR_THRESHOLD
+        trades = run_sweep_backtest(sym, daily, h4, pin, args.tp_rr,
+                                   args.max_bars, args.confluence)
 
-        print_summary(sweep_trades, f'{sym}  sweep_reversal_4h  (R/R {args.tp_rr}:1)')
-        print_summary(smc_trades,   f'{sym}  smc_detector       (R/R {args.tp_rr}:1)')
+        conf_label = ' +confluence' if args.confluence else ''
+        label = f'{sym}  sweep_reversal_4h  pin={pin:.2f}  R/R={args.tp_rr}:1  hold={args.max_bars}b{conf_label}'
+        print_summary(trades, label)
+        all_trades.extend(trades)
 
-        all_trades.extend(sweep_trades)
-        all_trades.extend(smc_trades)
+    if len(symbols) > 1:
+        print_summary(all_trades, 'ALL SYMBOLS COMBINED')
 
     if args.json:
         print('\n' + json.dumps(all_trades, indent=2))

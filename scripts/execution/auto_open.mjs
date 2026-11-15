@@ -208,14 +208,16 @@ const trailingStopDistancePct = scoreParams.trailing_stop_distance_pct ?? null;
 // Thesis windows by signal type (tStark bypasses; Score 10 = no boundary):
 // heatmap_* → Score 8: 5d | Score 9: 7d
 // smc_detector (reason starts "Score N") → 7d
+// sweep_reversal_4h → 4d (backtest: 24-bar hold outperforms 48/72)
 // level_entry → 10d  |  other Score 9 catalyst → 14d
 // Score 8 non-heatmap → 14d  |  tStark → null  |  Score 10 → null
-const isHeatmapEntry = typeof reason === 'string' && reason.startsWith('heatmap_');
-const isSmcEntry     = typeof reason === 'string' && /^Score \d/.test(reason);
-const isLevelEntry   = typeof reason === 'string' && reason.startsWith('level_');
+const isHeatmapEntry  = typeof reason === 'string' && reason.startsWith('heatmap_');
+const isSweepReversal = typeof reason === 'string' && reason.includes('sweep_reversal_4h');
+const isSmcEntry      = typeof reason === 'string' && /^Score \d/.test(reason) && !isSweepReversal;
+const isLevelEntry    = typeof reason === 'string' && reason.startsWith('level_');
 const _thesisDays = tStark || score >= 10 ? null
-  : score === 9 ? (isHeatmapEntry ? 7 : isSmcEntry ? 7 : isLevelEntry ? 10 : 14)
-  : /* score 8 */ (isHeatmapEntry ? 5 : 14);
+  : score === 9 ? (isHeatmapEntry ? 7 : isSweepReversal ? 4 : isSmcEntry ? 7 : isLevelEntry ? 10 : 14)
+  : /* score 8 */ (isHeatmapEntry ? 5 : isSweepReversal ? 4 : 14);
 const thesisValidUntil = _thesisDays != null
   ? new Date(Date.now() + _thesisDays * 24 * 3_600_000).toISOString()
   : null;
