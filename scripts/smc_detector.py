@@ -53,6 +53,12 @@ OTE_HIGH_FIB     = 0.786    # OTE zone upper boundary
 STATE_PATH       = os.path.join(CACHE_DIR, 'smc_pending_setups.json')
 SMC_4H_MIN_CANDLES = 10
 
+# ── Sweep-reversal constants (4H path) ────────────────────────────────────────
+SWEEP_PIVOT_LEN      = 5    # bars each side for 4H swing identification (wider than daily)
+SWEEP_MAX_HISTORY    = 80   # how many 4H bars back to search for swing lows (~13 days)
+SWEEP_MAX_BARS_AGO   = 12   # max age of sweep candle: 12 × 4h = 2 days
+SWEEP_EMA_PERIOD     = 50   # EMA period on 4H candles for G2 (≈ 8-day moving avg)
+
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
@@ -284,6 +290,160 @@ def calc_ote_zone(bos: dict, idm: dict) -> dict:
         }
 
 
+# ── Sweep-reversal detector (4H) ──────────────────────────────────────────────
+#
+# Detects "liquidity sweep + bullish reversal" on 4H candles — independent of
+# the daily BOS direction. Uses DAILY pivot lows as reference levels (not 4H),
+# so historically important swing lows (months-old macro levels like August lows)
+# are captured. 4H candles then supply the sweep + reversal confirmation.
+#
+# Reference: joshyattridge/smart-money-concepts + sudheer201/Liquidity-Sweep-Reversal-Systems
+#   "A candle's low pierces the swing low AND closes back inside → sweep confirmed.
+#    Enter at open of next candle in the reversal direction."
+
+def _ema(closes: list, period: int) -> Optional[float]:
+    if len(closes) < period:
+        return None
+    k   = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for c in closes[period:]:
+        ema = c * k + ema * (1.0 - k)
+    return ema
+
+
+def detect_sweep_reversal_4h(
+    candles_4h: list,
+    daily_pivot_lows: list,   # [(idx, price), ...] from find_pivots(daily_candles)
+    daily_ema200: float,
+    symbol: str,
+) -> Optional[dict]:
+    """
+    Scan 4H bars for a sell-side liquidity sweep → bullish reversal setup.
+
+    Uses daily pivot lows as the "significant levels" to watch — this captures
+    macro swing lows (e.g. August lows months ago) that the 4H fractal would miss.
+    Returns a scored result dict or None.
+    """
+    n = len(candles_4h)
+    if n < SWEEP_MAX_BARS_AGO + 4:
+        return None
+    if not daily_pivot_lows:
+        return None
+
+    closes_4h     = [c['close'] for c in candles_4h]
+    current_price = closes_4h[-1]
+    ema50_4h      = _ema(closes_4h, SWEEP_EMA_PERIOD)
+
+    # Use daily pivot lows as the reference sweep levels (most recent first)
+    # Only use lows that are BELOW the current price (potential buy-side IDM targets)
+    candidate_levels = sorted(
+        [(i, p) for i, p in daily_pivot_lows if p < current_price * 1.05],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    if not candidate_levels:
+        return None
+
+    # ── For each daily pivot low, check if a recent 4H candle swept it ────────
+    for _d_idx, sl_price in candidate_levels:
+        # Scan 4H candles newest-first for a sweep within SWEEP_MAX_BARS_AGO
+        for j in range(n - 1, max(0, n - 1 - SWEEP_MAX_BARS_AGO - 1), -1):
+            cj = candles_4h[j]
+
+            # Sweep condition:
+            #   wick went below daily pivot low AND candle CLOSED back above it
+            if cj['low'] >= sl_price or cj['close'] <= sl_price:
+                continue
+
+            bars_ago = n - 1 - j
+
+            # ── G3: Liquidity sweep identified (+2) — always satisfied here ──
+
+            # ── G2: 4H EMA50 — price above = bullish intraday bias ────────────
+            g2 = ema50_4h is not None and current_price > ema50_4h
+
+            # ── G4: Order Block = last bearish 4H candle at or before sweep ───
+            ob_low = ob_high = None
+            search_back = max(0, j - 10)
+            for k in range(j - 1, search_back, -1):
+                ck = candles_4h[k]
+                if ck['close'] < ck['open']:      # bearish candle = OB candidate
+                    ob_low  = ck['low']
+                    ob_high = ck['high']
+                    break
+            g4 = ob_low is not None
+
+            # ── G5: Current price inside OB zone ─────────────────────────────
+            g5 = g4 and (ob_low <= current_price <= ob_high)
+
+            # ── G6: Reversal confirmation — sweep candle closes bullish ───────
+            g6 = cj['close'] > cj['open']
+
+            # ── G1: 4H BOS post-sweep — close above most recent pre-sweep ─────
+            #    4H swing high (highest high in [j-20, j] window)
+            pre_sweep_window = candles_4h[max(0, j - 20) : j]
+            pre_sweep_high   = max((c['high'] for c in pre_sweep_window), default=None)
+
+            g1 = False
+            if pre_sweep_high is not None:
+                for m in range(j + 1, n):
+                    if candles_4h[m]['close'] > pre_sweep_high:
+                        g1 = True
+                        break
+
+            # ── G7: R/R ≥ 1:2 ────────────────────────────────────────────────
+            # SL = 0.2% below sweep wick; Target = highest 4H high in pre-sweep window
+            sl_level     = cj['low'] * 0.998
+            sl_dist      = current_price - sl_level
+            target_price = pre_sweep_high if pre_sweep_high else current_price
+            rr = (target_price - current_price) / sl_dist if sl_dist > 0 else 0.0
+            g7 = rr >= 2.0
+
+            score = (
+                (2 if g1 else 0) +
+                (1 if g2 else 0) +
+                2 +                        # G3 always +2
+                (2 if g4 else 0) +
+                (1 if g5 else 0) +
+                (1 if g6 else 0) +
+                (1 if g7 else 0)
+            )
+
+            if score < 8:
+                continue   # below monitoring threshold — skip
+
+            return {
+                'symbol':           symbol,
+                'score':            score,
+                'side':             'long',
+                'strategy':         'sweep_reversal_4h',
+                'current_price':    round(current_price, 4),
+                'daily_close':      round(current_price, 4),
+                'sweep_level':      round(sl_price, 4),
+                'sweep_wick_low':   round(cj['low'], 4),
+                'ob_low':           round(ob_low,  4) if ob_low  else None,
+                'ob_high':          round(ob_high, 4) if ob_high else None,
+                'sl_level':         round(sl_level, 4),
+                'rr':               round(rr, 2),
+                'bars_since_sweep': bars_ago,
+                'g1_bos_4h':        g1,
+                'g2_ema50_4h':      g2,
+                'g3_sweep':         True,
+                'g4_ob':            g4,
+                'g5_in_ob':         g5,
+                'g6_reversal':      g6,
+                'g7_rr':            g7,
+                'idm_swept':        True,
+                'reason':           (
+                    f'Score {score} (sweep_reversal_4h): '
+                    f'4H sweep of daily pivot {sl_price:.4f} → long | '
+                    f'G1={g1} G2={g2} G4={g4} G6={g6} G7={g7} RR={rr:.1f}'
+                ),
+            }
+
+    return None
+
+
 # ── Main setup detector ───────────────────────────────────────────────────────
 
 def detect_setup(candles: list, symbol: str,
@@ -405,6 +565,7 @@ def main() -> None:
             candles_4h = load_ohlcv_4h(symbol)
             price_4h   = candles_4h[-1]['close'] if candles_4h else None
             out        = detect_setup(candles, symbol, price_4h)
+            _, pivot_lows = find_pivots(candles)   # daily pivots for sweep detector
 
             # 4H intraday IDM sweep — only for Score-8 (IDM not yet swept on daily)
             if out['score'] == 8 and candles_4h and out.get('bos_timestamp'):
@@ -420,6 +581,20 @@ def main() -> None:
                         if out['ote_low'] <= price_4h <= out['ote_high']:
                             out['score']  = 10
                             out['reason'] = 'Score 10 (4H): IDM swept on 4H + in OTE'
+
+            # ── Sweep-reversal path: additional 4H signal (independent of daily BOS) ──
+            # Uses daily pivot lows as reference levels so macro lows (months old)
+            # are captured. Outputs a SECOND line for the symbol when found.
+            if candles_4h:
+                sweep = detect_sweep_reversal_4h(
+                    candles_4h,
+                    pivot_lows,                    # daily pivot lows
+                    out.get('ema200') or 0.0,
+                    symbol,
+                )
+                if sweep is not None:
+                    outputs.append(sweep)
+                    state_changes += 1
 
             # State: persist Score-8 setups (IDM not yet swept)
             if out['score'] == 8:
