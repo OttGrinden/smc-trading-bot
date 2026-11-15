@@ -223,7 +223,7 @@ if (RUN_SCAN) {
         fs.writeFileSync(runLogPath,   JSON.stringify(slRunLog));
         fs.writeFileSync(emptyDecPath, JSON.stringify([]));
         const enginePath = path.join(cwd, 'scripts', 'execution', 'portfolio', 'portfolio_engine.mjs');
-        spawnSync(process.execPath, [enginePath, '--run-log', runLogPath, '--decisions', emptyDecPath], { stdio: 'inherit' });
+        spawnSync(process.execPath, [enginePath, '--run-log', runLogPath, '--decisions', emptyDecPath, '--post-sl-block-hours', '0'], { stdio: 'inherit' });
         try { fs.unlinkSync(runLogPath); } catch {}
       }
     }
