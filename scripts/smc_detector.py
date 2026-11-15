@@ -379,10 +379,21 @@ def detect_sweep_reversal_4h(
             # ── G6: Reversal confirmation — sweep candle closes bullish ───────
             g6 = cj['close'] > cj['open']
 
-            # ── G1: 4H BOS post-sweep — close above most recent pre-sweep ─────
-            #    4H swing high (highest high in [j-20, j] window)
-            pre_sweep_window = candles_4h[max(0, j - 20) : j]
-            pre_sweep_high   = max((c['high'] for c in pre_sweep_window), default=None)
+            # ── G1: 4H BOS post-sweep — close above nearest pre-sweep swing high ─
+            # Uses 2-bar fractal to find the nearest confirmed swing high before
+            # the sweep (NOT the absolute max of 20 bars — that is too far away).
+            # Fallback: highest high of the 3 bars immediately before the sweep.
+            pre_sweep_high = None
+            for k in range(j - 1, max(0, j - 20), -1):
+                h  = candles_4h[k]['high']
+                ws = max(0, k - 2)
+                we = min(n, k + 3)
+                neighbors = [candles_4h[m]['high'] for m in range(ws, we) if m != k]
+                if neighbors and h > max(neighbors):
+                    pre_sweep_high = h
+                    break
+            if pre_sweep_high is None and j >= 3:
+                pre_sweep_high = max(candles_4h[m]['high'] for m in range(max(0, j - 3), j))
 
             g1 = False
             if pre_sweep_high is not None:
