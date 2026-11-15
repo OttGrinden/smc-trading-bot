@@ -284,6 +284,16 @@ if (state.open_positions.some(p => p.symbol === symbol && p.side === side)) {
   policyErrors.push(`position_already_open: ${symbol} ${side}`);
 }
 
+// Gate 5: R/R ≥ 2.0 for heatmap entries (G7-equivalent)
+// smc_detector.py enforces G7 internally — only heatmap signals lack this check.
+if (isHeatmapEntry) {
+  if (!structTp) {
+    policyErrors.push(`rr_gate_failed: no structural TP found for ${symbol} — cannot verify R/R ≥ 2.0 (G7)`);
+  } else if (structTp.rr < 2.0) {
+    policyErrors.push(`rr_gate_failed: R/R ${structTp.rr.toFixed(2)} < 2.0 (G7 minimum) — nearest S/R too close to entry`);
+  }
+}
+
 if (policyErrors.length) {
   for (const e of policyErrors) process.stderr.write(JSON.stringify({ error: 'policy_gate_failed', detail: e }) + '\n');
   process.exit(1);
