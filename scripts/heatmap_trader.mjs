@@ -32,10 +32,12 @@ const HEATMAP_PATH = join(CACHE_DIR, 'liq_heatmap.json');
 
 const HEATMAP_SYMBOLS  = ['BTC', 'ETH', 'XRP', 'SOL', 'BNB'];
 const LONG_BS_MIN      = 1.15;        // min buy/sell ratio for LONG signal
-const ENTRY_NEAR_PCT   = 1.5;         // buy wall must be within 1.5% below price
+const SHORT_BS_MAX     = +(1 / 1.15).toFixed(2);  // ≈ 0.87: max buy/sell ratio for SHORT signal
+const ENTRY_NEAR_PCT   = 1.5;         // wall must be within 1.5% of price
 const MIN_WALL_USD     = 3_000_000;   // min wall notional $3M
 const HEATMAP_SCORE    = 8;           // technical signal → score 8, SL 3.3%, 5% NAV
 const HEATMAP_REASON   = 'heatmap_short_squeeze';
+const SHORT_HEATMAP_REASON = 'heatmap_long_squeeze';
 const MAX_HEATMAP_AGE_MIN = 16;       // reject stale cache (>16 min old)
 // Ceiling8-bypass is NOT available for heatmap signals (Score 8).
 // Only smc_scan.mjs dispatches Score 9+ signals that may bypass ceiling8 blocks.
@@ -84,7 +86,8 @@ for (const sym of HEATMAP_SYMBOLS) {
     log({ warn: 'heatmap_trader_stale', symbol: sym, age_min: Math.round(ageMin) }); continue;
   }
 
-  const wall = entry.nearest_buy_wall;
+  const wall      = entry.nearest_buy_wall;
+  const sellWall  = entry.nearest_sell_wall;
 
   // LONG signal conditions
   const hasSqueeze = entry.squeeze_potential === 'short_squeeze_zones_detected';
@@ -93,48 +96,91 @@ for (const sym of HEATMAP_SYMBOLS) {
     && wall.pct_away >= -ENTRY_NEAR_PCT     // within ENTRY_NEAR_PCT% below price
     && wall.notional_usd >= MIN_WALL_USD;
 
-  if (!hasSqueeze || !hasRatio || !hasWall) {
+  if (hasSqueeze && hasRatio && hasWall) {
+    signals.push({
+      symbol:            sym,
+      side:              'long',
+      score:             HEATMAP_SCORE,
+      reason:            HEATMAP_REASON,
+      current_price:     entry.current_price,
+      limit_price:       wall.price,
+      buy_sell_ratio:    entry.buy_sell_ratio,
+      wall_notional_usd: wall.notional_usd,
+      wall_pct_away:     wall.pct_away,
+      squeeze:           entry.squeeze_potential,
+      heatmap_age_min:   Math.round(ageMin),
+      bypass_ceiling8:   false,
+    });
     log({
-      info:    'heatmap_trader_no_signal',
-      symbol:  sym,
-      ratio:   entry.buy_sell_ratio,
-      squeeze: entry.squeeze_potential,
+      info:        'heatmap_trader_signal',
+      symbol:      sym,
+      side:        'long',
+      price:       entry.current_price,
+      limit_price: wall.price,
+      wall_pct:    wall.pct_away,
+      wall_usd:    Math.round(wall.notional_usd / 1e6 * 10) / 10 + 'M',
+      bs_ratio:    entry.buy_sell_ratio,
+    });
+  } else {
+    log({
+      info:     'heatmap_trader_no_long_signal',
+      symbol:   sym,
+      ratio:    entry.buy_sell_ratio,
+      squeeze:  entry.squeeze_potential,
       wall_pct: wall?.pct_away ?? null,
       wall_usd: wall ? Math.round(wall.notional_usd / 1e6 * 10) / 10 + 'M' : null,
-      reasons: [
-        !hasSqueeze && 'no_squeeze',
+      reasons:  [
+        !hasSqueeze && 'no_long_squeeze',
         !hasRatio   && `ratio_${entry.buy_sell_ratio}<${LONG_BS_MIN}`,
-        !hasWall    && (wall ? `wall_far_${wall.pct_away}%_or_small` : 'no_wall'),
+        !hasWall    && (wall ? `wall_far_${wall.pct_away}%_or_small` : 'no_buy_wall'),
       ].filter(Boolean),
     });
-    continue;
   }
 
-  signals.push({
-    symbol:       sym,
-    side:         'long',
-    score:        HEATMAP_SCORE,
-    reason:       HEATMAP_REASON,
-    current_price: entry.current_price,
-    limit_price:  wall.price,        // buy wall = limit entry level
-    buy_sell_ratio: entry.buy_sell_ratio,
-    wall_notional_usd: wall.notional_usd,
-    wall_pct_away:     wall.pct_away,
-    squeeze:      entry.squeeze_potential,
-    heatmap_age_min: Math.round(ageMin),
-    bypass_ceiling8: false,
-  });
+  // SHORT signal conditions — sell wall above price + sell pressure dominant
+  const hasShortRatio = entry.buy_sell_ratio <= SHORT_BS_MAX;
+  const hasShortWall  = sellWall != null
+    && sellWall.pct_away <= ENTRY_NEAR_PCT     // within ENTRY_NEAR_PCT% above price
+    && sellWall.notional_usd >= MIN_WALL_USD;
 
-  log({
-    info:        'heatmap_trader_signal',
-    symbol:      sym,
-    side:        'long',
-    price:       entry.current_price,
-    limit_price: wall.price,
-    wall_pct:    wall.pct_away,
-    wall_usd:    Math.round(wall.notional_usd / 1e6 * 10) / 10 + 'M',
-    bs_ratio:    entry.buy_sell_ratio,
-  });
+  if (hasShortRatio && hasShortWall) {
+    signals.push({
+      symbol:            sym,
+      side:              'short',
+      score:             HEATMAP_SCORE,
+      reason:            SHORT_HEATMAP_REASON,
+      current_price:     entry.current_price,
+      limit_price:       sellWall.price,
+      buy_sell_ratio:    entry.buy_sell_ratio,
+      wall_notional_usd: sellWall.notional_usd,
+      wall_pct_away:     sellWall.pct_away,
+      squeeze:           entry.squeeze_potential,
+      heatmap_age_min:   Math.round(ageMin),
+      bypass_ceiling8:   false,
+    });
+    log({
+      info:        'heatmap_trader_signal',
+      symbol:      sym,
+      side:        'short',
+      price:       entry.current_price,
+      limit_price: sellWall.price,
+      wall_pct:    sellWall.pct_away,
+      wall_usd:    Math.round(sellWall.notional_usd / 1e6 * 10) / 10 + 'M',
+      bs_ratio:    entry.buy_sell_ratio,
+    });
+  } else {
+    log({
+      info:          'heatmap_trader_no_short_signal',
+      symbol:        sym,
+      ratio:         entry.buy_sell_ratio,
+      sell_wall_pct: sellWall?.pct_away ?? null,
+      sell_wall_usd: sellWall ? Math.round(sellWall.notional_usd / 1e6 * 10) / 10 + 'M' : null,
+      reasons:       [
+        !hasShortRatio && `ratio_${entry.buy_sell_ratio}>${SHORT_BS_MAX}`,
+        !hasShortWall  && (sellWall ? `sell_wall_far_${sellWall.pct_away}%_or_small` : 'no_sell_wall'),
+      ].filter(Boolean),
+    });
+  }
 }
 
 log({ info: 'heatmap_trader_signals_total', count: signals.length, dry_run: DRY_RUN, live: LIVE });

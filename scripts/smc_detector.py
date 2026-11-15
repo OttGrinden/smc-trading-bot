@@ -603,6 +603,237 @@ def detect_sweep_reversal_1h(
     return None
 
 
+def detect_sweep_reversal_4h_short(
+    candles_4h: list,
+    daily_pivot_highs: list,   # [(idx, price), ...] from find_pivots(daily_candles)
+    daily_ema200: float,
+    symbol: str,
+) -> Optional[dict]:
+    """
+    Scan 4H bars for a buy-side liquidity sweep → bearish reversal setup.
+
+    Mirror of detect_sweep_reversal_4h but for SHORT:
+    - Uses daily pivot HIGHS as reference (buy-side liquidity above price).
+    - Sweep: 4H wick pierces daily pivot high AND closes back below it.
+    - Entry in the SHORT direction at current price after confirmation.
+    """
+    n = len(candles_4h)
+    if n < SWEEP_MAX_BARS_AGO + 4:
+        return None
+    if not daily_pivot_highs:
+        return None
+
+    closes_4h     = [c['close'] for c in candles_4h]
+    current_price = closes_4h[-1]
+    ema50_4h      = _ema(closes_4h, SWEEP_EMA_PERIOD)
+
+    candidate_levels = sorted(
+        [(i, p) for i, p in daily_pivot_highs if p > current_price * 0.95],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    if not candidate_levels:
+        return None
+
+    for _d_idx, sh_price in candidate_levels:
+        for j in range(n - 1, max(0, n - 1 - SWEEP_MAX_BARS_AGO - 1), -1):
+            cj = candles_4h[j]
+
+            # Sweep: wick pierced daily pivot high AND closed back below it
+            if cj['high'] <= sh_price or cj['close'] >= sh_price:
+                continue
+
+            bars_ago = n - 1 - j
+
+            # G2: EMA50 — price below = bearish intraday bias
+            g2 = ema50_4h is not None and current_price < ema50_4h
+
+            # G4: Last BULLISH 4H candle before sweep = bearish OB candidate
+            ob_low = ob_high = None
+            search_back = max(0, j - 10)
+            for k in range(j - 1, search_back, -1):
+                ck = candles_4h[k]
+                if ck['close'] > ck['open']:
+                    ob_low  = ck['low']
+                    ob_high = ck['high']
+                    break
+            g4 = ob_low is not None
+
+            # G5: Current price inside OB zone
+            g5 = g4 and (ob_low <= current_price <= ob_high)
+
+            # G6: Sweep candle closes BEARISH
+            g6 = cj['close'] < cj['open']
+
+            # G1: Bearish pin-bar — close near the LOW of the sweep candle = strong rejection
+            candle_range   = cj['high'] - cj['low']
+            close_pos_bear = (cj['high'] - cj['close']) / candle_range if candle_range > 0 else 0.0
+            g1             = close_pos_bear >= SWEEP_G1_PIN_BAR_THRESHOLD
+
+            # G7: R/R ≥ 1:2 (SHORT) — SL above wick, TP = lowest low in prior 50 bars
+            sl_level     = cj['high'] * 1.002
+            sl_dist      = sl_level - current_price
+            lb_start     = max(0, j - 50)
+            target_price = min(c2['low'] for c2 in candles_4h[lb_start:j]) if j > 0 else current_price
+            rr           = (current_price - target_price) / sl_dist if sl_dist > 0 else 0.0
+            g7           = rr >= 2.0
+
+            score = (
+                (2 if g1 else 0) +
+                (1 if g2 else 0) +
+                2 +
+                (2 if g4 else 0) +
+                (1 if g5 else 0) +
+                (1 if g6 else 0) +
+                (1 if g7 else 0)
+            )
+
+            if score < 8:
+                continue
+
+            return {
+                'symbol':           symbol,
+                'score':            score,
+                'side':             'short',
+                'strategy':         'sweep_reversal_4h_short',
+                'current_price':    round(current_price, 4),
+                'daily_close':      round(current_price, 4),
+                'sweep_level':      round(sh_price, 4),
+                'sweep_wick_high':  round(cj['high'], 4),
+                'ob_low':           round(ob_low,  4) if ob_low  else None,
+                'ob_high':          round(ob_high, 4) if ob_high else None,
+                'sl_level':         round(sl_level, 4),
+                'rr':               round(rr, 2),
+                'bars_since_sweep': bars_ago,
+                'g1_bos_4h':        g1,
+                'g2_ema50_4h':      g2,
+                'g3_sweep':         True,
+                'g4_ob':            g4,
+                'g5_in_ob':         g5,
+                'g6_reversal':      g6,
+                'g7_rr':            g7,
+                'idm_swept':        True,
+                'reason':           (
+                    f'Score {score} (sweep_reversal_4h_short): '
+                    f'4H sweep of daily pivot {sh_price:.4f} → short | '
+                    f'G1={g1} G2={g2} G4={g4} G6={g6} G7={g7} RR={rr:.1f}'
+                ),
+            }
+
+    return None
+
+
+def detect_sweep_reversal_1h_short(
+    candles_1h: list,
+    h4_pivot_highs: list,   # [(idx, price), ...] from find_pivots(candles_4h)
+    daily_ema200: float,
+    symbol: str,
+) -> Optional[dict]:
+    """
+    1H counterpart of detect_sweep_reversal_4h_short.
+
+    Uses 4H pivot HIGHS as reference levels for bearish sweep detection.
+    Two roles: standalone (Score ≤ 8, monitoring) or 4H-short confluence confirmation.
+    """
+    n = len(candles_1h)
+    if n < SWEEP_1H_MIN_CANDLES + SWEEP_1H_MAX_BARS_AGO:
+        return None
+    if not h4_pivot_highs:
+        return None
+
+    closes_1h     = [c['close'] for c in candles_1h]
+    current_price = closes_1h[-1]
+    ema50_1h      = _ema(closes_1h, SWEEP_1H_EMA_PERIOD)
+
+    candidate_levels = sorted(
+        [(i, p) for i, p in h4_pivot_highs if p > current_price * 0.97],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    if not candidate_levels:
+        return None
+
+    for _h4_idx, sh_price in candidate_levels:
+        for j in range(n - 1, max(0, n - 1 - SWEEP_1H_MAX_BARS_AGO - 1), -1):
+            cj = candles_1h[j]
+
+            # Sweep: wick above 4H pivot high, close back below it
+            if cj['high'] <= sh_price or cj['close'] >= sh_price:
+                continue
+
+            bars_ago = n - 1 - j
+
+            g2 = ema50_1h is not None and current_price < ema50_1h
+
+            ob_low = ob_high = None
+            for k in range(j - 1, max(0, j - 8), -1):
+                ck = candles_1h[k]
+                if ck['close'] > ck['open']:
+                    ob_low  = ck['low']
+                    ob_high = ck['high']
+                    break
+            g4 = ob_low is not None
+
+            g5 = g4 and (ob_low <= current_price <= ob_high)
+            g6 = cj['close'] < cj['open']
+
+            candle_range   = cj['high'] - cj['low']
+            close_pos_bear = (cj['high'] - cj['close']) / candle_range if candle_range > 0 else 0.0
+            g1             = close_pos_bear >= SWEEP_G1_PIN_BAR_THRESHOLD
+
+            sl_level     = cj['high'] * 1.002
+            sl_dist      = sl_level - current_price
+            lb_start     = max(0, j - SWEEP_1H_G7_LOOKBACK)
+            target_price = min(c2['low'] for c2 in candles_1h[lb_start:j]) if j > 0 else current_price
+            rr           = (current_price - target_price) / sl_dist if sl_dist > 0 else 0.0
+            g7           = rr >= 2.0
+
+            score = (
+                (2 if g1 else 0) +
+                (1 if g2 else 0) +
+                2 +
+                (2 if g4 else 0) +
+                (1 if g5 else 0) +
+                (1 if g6 else 0) +
+                (1 if g7 else 0)
+            )
+
+            if score < 7:
+                continue
+
+            return {
+                'symbol':             symbol,
+                'score':              score,
+                'side':               'short',
+                'strategy':           'sweep_reversal_1h_short',
+                'current_price':      round(current_price, 4),
+                'daily_close':        round(current_price, 4),
+                'sweep_level':        round(sh_price, 4),
+                'sweep_wick_high':    round(cj['high'], 4),
+                'ob_low':             round(ob_low,  4) if ob_low  else None,
+                'ob_high':            round(ob_high, 4) if ob_high else None,
+                'sl_level':           round(sl_level, 4),
+                'rr':                 round(rr, 2),
+                'bars_since_sweep':   bars_ago,
+                'g1_bos_1h':          g1,
+                'g2_ema50_1h':        g2,
+                'g3_sweep':           True,
+                'g4_ob':              g4,
+                'g5_in_ob':           g5,
+                'g6_reversal':        g6,
+                'g7_rr':              g7,
+                'idm_swept':          True,
+                'confluence_role':    'standalone',
+                'reason':             (
+                    f'Score {score} (sweep_reversal_1h_short): '
+                    f'1H sweep of 4H pivot {sh_price:.4f} → short | '
+                    f'G1={g1} G2={g2} G4={g4} G6={g6} G7={g7} RR={rr:.1f}'
+                ),
+            }
+
+    return None
+
+
 # ── Main setup detector ───────────────────────────────────────────────────────
 
 def detect_setup(candles: list, symbol: str,
@@ -725,7 +956,7 @@ def main() -> None:
             candles_1h = load_ohlcv_1h(symbol)
             price_4h   = candles_4h[-1]['close'] if candles_4h else None
             out        = detect_setup(candles, symbol, price_4h)
-            _, pivot_lows = find_pivots(candles)   # daily pivots for 4H sweep detector
+            pivot_highs, pivot_lows = find_pivots(candles)   # daily pivots for sweep detectors
 
             # 4H intraday IDM sweep — only for Score-8 (IDM not yet swept on daily)
             if out['score'] == 8 and candles_4h and out.get('bos_timestamp'):
@@ -821,7 +1052,7 @@ def main() -> None:
             #      1H demand confirmation) → restores original score → auto_open.
             #   B) Standalone (no 4H pending) → Score capped at 8 (monitoring).
             if candles_4h and candles_1h:
-                _, h4_pivot_lows = find_pivots(candles_4h)   # 4H lows as ref
+                h4_pivot_highs, h4_pivot_lows = find_pivots(candles_4h)   # 4H pivots for 1H detectors
                 sweep_1h = detect_sweep_reversal_1h(
                     candles_1h,
                     h4_pivot_lows,
@@ -874,6 +1105,118 @@ def main() -> None:
 
                     if sweep_1h is not None:
                         outputs.append(sweep_1h)
+                        state_changes += 1
+
+            # ── Sweep-reversal SHORT path: 4H bearish sweep ───────────────────
+            if candles_4h:
+                sweep_short = detect_sweep_reversal_4h_short(
+                    candles_4h,
+                    pivot_highs,
+                    out.get('ema200') or 0.0,
+                    symbol,
+                )
+                if sweep_short is not None:
+                    pending_sweep_short = next(
+                        (s for s in pending_setups
+                         if s['symbol'] == symbol
+                         and s.get('strategy') == 'sweep_reversal_4h_short'
+                         and s['status'] == 'pending_confirmation'),
+                        None,
+                    )
+
+                    confluence_confirmed_short = False
+                    if pending_sweep_short is not None:
+                        ref_level = pending_sweep_short.get('sweep_level', 0)
+                        same_lvl  = ref_level > 0 and abs(ref_level - sweep_short['sweep_level']) / ref_level < 0.005
+                        if same_lvl:
+                            sig_ts   = pending_sweep_short.get('signal_4h_ts', 0)
+                            conf_bar = next(
+                                (c for c in candles_4h if c['timestamp'] > sig_ts), None
+                            )
+                            # Bearish confirmation: next 4H bar must close bearish
+                            if conf_bar is not None and conf_bar['close'] < conf_bar['open']:
+                                confluence_confirmed_short = True
+
+                    sweep_short['confluence_confirmed'] = confluence_confirmed_short
+
+                    pending_setups = [
+                        s for s in pending_setups
+                        if not (s['symbol'] == symbol and s.get('strategy') == 'sweep_reversal_4h_short')
+                    ]
+
+                    if not confluence_confirmed_short:
+                        pending_setups.append({
+                            'symbol':             symbol,
+                            'strategy':           'sweep_reversal_4h_short',
+                            'side':               'short',
+                            'score':              sweep_short['score'],
+                            'sweep_level':        sweep_short['sweep_level'],
+                            'signal_4h_ts':       candles_4h[-1]['timestamp'],
+                            'confirmation_price': sweep_short['current_price'],
+                            'entry_timestamp':    datetime.now(timezone.utc).isoformat(),
+                            'status':             'pending_confirmation',
+                        })
+                        sweep_short['score']  = max(0, sweep_short['score'] - 1)
+                        sweep_short['reason'] = sweep_short['reason'] + ' [waiting confluence: next 4H bar must close bearish]'
+
+                    outputs.append(sweep_short)
+                    state_changes += 1
+                else:
+                    pending_setups = [
+                        s for s in pending_setups
+                        if not (s['symbol'] == symbol and s.get('strategy') == 'sweep_reversal_4h_short')
+                    ]
+
+            # ── 1H sweep-reversal SHORT path ──────────────────────────────────
+            if candles_4h and candles_1h:
+                h4_phighs, _ = find_pivots(candles_4h)
+                sweep_1h_short = detect_sweep_reversal_1h_short(
+                    candles_1h,
+                    h4_phighs,
+                    out.get('ema200') or 0.0,
+                    symbol,
+                )
+                if sweep_1h_short is not None:
+                    pending_4h_short = next(
+                        (s for s in pending_setups
+                         if s['symbol'] == symbol
+                         and s.get('strategy') == 'sweep_reversal_4h_short'
+                         and s['status'] == 'pending_confirmation'
+                         and s.get('side') == 'short'),
+                        None,
+                    )
+
+                    if pending_4h_short is not None:
+                        original_score_short = pending_4h_short['score']
+                        for sig in outputs:
+                            if (sig.get('strategy') == 'sweep_reversal_4h_short'
+                                    and sig.get('symbol') == symbol
+                                    and sig.get('side') == 'short'):
+                                sig['score']               = original_score_short
+                                sig['confluence_confirmed'] = True
+                                sig['confluence_source']    = 'sweep_reversal_1h_short'
+                                sig['reason']               = sig['reason'].replace(
+                                    ' [waiting confluence: next 4H bar must close bearish]',
+                                    ' [confluence confirmed by 1H short sweep]',
+                                )
+                                break
+                        pending_setups = [
+                            s for s in pending_setups
+                            if not (s['symbol'] == symbol
+                                    and s.get('strategy') == 'sweep_reversal_4h_short')
+                        ]
+                        sweep_1h_short['confluence_role']      = '4h_confirmation'
+                        sweep_1h_short['confluence_confirmed'] = True
+                        state_changes += 1
+                    else:
+                        sweep_1h_short['score']              = min(sweep_1h_short['score'], 8)
+                        sweep_1h_short['confluence_role']    = 'standalone'
+                        sweep_1h_short['confluence_confirmed'] = False
+                        if sweep_1h_short['score'] < 8:
+                            sweep_1h_short = None
+
+                    if sweep_1h_short is not None:
+                        outputs.append(sweep_1h_short)
                         state_changes += 1
 
             # State: persist Score-8 setups (IDM not yet swept)
