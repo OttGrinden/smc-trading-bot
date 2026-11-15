@@ -54,17 +54,26 @@ paper_runbook.mjs
 ## Signals
 
 A trade opens when ALL conditions are met:
-- **Regime**: GREEN (FNG 30-74, ATR < 4%)
-- **Heatmap**: buy/sell ratio >= 1.15 with buy wall >= ~$3M within 0.5%
+- **Regime**: GREEN (FNG 10–80, ATR ≥ 1.5% — FNG < 10 = extreme panic, > 80 = extreme greed)
+- **Heatmap**: buy/sell ratio ≥ 1.15 with buy wall within 0.5%
 - **Portfolio**: < 5 open positions, symbol not blocked, cash floor > 20%
 
-## Scoring (1-10)
-| Score | Condition | Action |
-|-------|-----------|--------|
-| 10 | K=ja + RSI checked + Fib in zone | Auto-open, 10x leverage, SL 2% |
-| 9  | K=ja + RSI checked | Auto-open, 8x leverage, SL 2.5% |
-| 8  | K=ja OR T_stark | Auto-open, 6x leverage, SL 3.3% |
-| 6-7 | Partial | Watchlist only |
+## SMC Scoring (G1–G7, max 10 pts)
+| Gate | Criterion | Points |
+|------|-----------|--------|
+| G1 | BOS confirmed in trade direction | +2 |
+| G2 | EMA200 confirmed (long: price above / short: below) | +1 |
+| G3 | Liquidity sweep / IDM identified | +2 |
+| G4 | Order Block drawn | +2 |
+| G5 | Price returns to OB | +1 |
+| G6 | Candlestick confirmation | +1 |
+| G7 | R/R ≥ 1:2 | +1 |
+
+| Score | Action |
+|-------|--------|
+| ≥ 9 | Auto-open after thesis_reviewer approval |
+| 8 | Monitoring only — no auto-open |
+| ≤ 7 | No signal |
 
 ## Environment Variables
 

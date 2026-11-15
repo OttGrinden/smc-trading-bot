@@ -55,6 +55,12 @@ const takeProfitPct         = args.takeProfitPct           ? parseFloat(args.tak
 const breakevenTriggerPct   = args.breakevenTriggerPct     ? parseFloat(args.breakevenTriggerPct)     : null;
 const trailingStopDistPct   = args.trailingStopDistancePct ? parseFloat(args.trailingStopDistancePct) : null;
 
+// Detect asset type: explicit flag > symbol heuristic (all current symbols are crypto) > default crypto
+const CRYPTO_SYMBOLS = new Set(['BTC','ETH','SOL','XRP','BNB','TAO','DOGE','AVAX','LINK','ADA','DOT','MATIC','LTC','ATOM']);
+const assetType = args.assetType
+  ? String(args.assetType).toLowerCase()
+  : (symbol && CRYPTO_SYMBOLS.has(symbol.toUpperCase()) ? 'crypto' : 'crypto');
+
 // ─── Validation ───────────────────────────────────────────────────────────────
 
 const errors = [];
@@ -153,7 +159,7 @@ const intent = {
   direction:  side === 'long' ? 'LONG' : 'SHORT',
   price_usd:  priceUsd,
   intent_id:  `intent_manual_open_${symbol}_${Date.now()}`,
-  category:   'stock',
+  category:   assetType,
   sector:     null,
   change_pct: 0, volume_usd: 0, rank: 0, score: 0, risk: null, technical: null,
 };
@@ -197,7 +203,7 @@ auditLog('portfolio_position_opened', {
 // Add to open positions
 state.open_positions.push({
   symbol,
-  asset_type:       'stock',
+  asset_type:       assetType,
   side,
   quantity,
   notional_eur:     notionalEur,
