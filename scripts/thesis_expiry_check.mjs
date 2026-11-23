@@ -112,6 +112,38 @@ for (const pos of state.open_positions) {
 
   if (pnlPct === null) { skipped++; continue; }
 
+  // ── OB-Scalp positions: separate exit logic (TP hit + 2h timeout) ──────────
+  if (pos.strategy === 'ob_scalp') {
+    checked++;
+    // TP hit: close as soon as mark >= tp_price_usd
+    const tpUsd   = pos.tp_price_usd;
+    const markUsd = pos.mark_price_usd;
+    if (tpUsd && markUsd && markUsd >= tpUsd) {
+      const ok = doClose(pos, `scalp_tp_hit_${markUsd.toFixed(4)}`, isoInDays(1));
+      if (ok) {
+        closed++;
+        process.stderr.write(JSON.stringify({
+          info: 'scalp_exit', trigger: 'tp_hit',
+          symbol: pos.symbol, pnl_pct: +pnlPct.toFixed(3),
+          mark: markUsd, tp: tpUsd,
+        }) + '\n');
+      } else { skipped++; }
+    } else if (pos.thesis_valid_until && new Date(pos.thesis_valid_until) < now) {
+      // 2h timeout — close at market regardless of PnL
+      const ok = doClose(pos, `scalp_timeout_${daysStr}d_pnl${pnlPct.toFixed(2)}pct`, isoInDays(1));
+      if (ok) {
+        closed++;
+        process.stderr.write(JSON.stringify({
+          info: 'scalp_exit', trigger: 'timeout',
+          symbol: pos.symbol, pnl_pct: +pnlPct.toFixed(3), days_held: daysStr,
+        }) + '\n');
+      } else { skipped++; }
+    } else {
+      skipped++; // holding — SL handled by portfolio_engine
+    }
+    continue;
+  }
+
   // Safety: positions with large moves (profit or loss) belong to SL engine or manual decision
   if (Math.abs(pnlPct) >= SL_SAFETY_THRESHOLD) {
     skipped++;

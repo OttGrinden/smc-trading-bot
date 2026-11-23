@@ -298,7 +298,7 @@ export function recompute(state) {
 
   for (const pos of state.open_positions) {
     pos.unrealized_pnl_eur = positionUnrealized(pos);
-    committed     += pos.notional_eur;
+    committed     += pos.margin_eur != null ? pos.margin_eur : pos.notional_eur;
     unrealized    += pos.unrealized_pnl_eur;
     if (pos.mark_price_eur != null) {
       const mv = pos.quantity * pos.mark_price_eur;            // current market notional (EUR)

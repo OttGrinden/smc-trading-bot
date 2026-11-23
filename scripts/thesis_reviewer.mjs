@@ -100,12 +100,39 @@ const fundingLabel  = fundingRate === null ? 'unknown'
 const lsRatio       = pos?.long_short_ratio != null ? String(pos.long_short_ratio) : 'n/a';
 
 // --- Build prompt ---
-const SYSTEM = `You are a binary trade-gatekeeper for a crypto SMC strategy. \
-Given technical signal data, respond ONLY with a single JSON object on one line: \
-{"approved":bool,"confidence":1-10,"reason":"max 15 words"}. \
-Approve when: (1) nearest sell wall (LONG) or buy wall (SHORT) is at least 3% away OR \
-confirms the target zone, AND (2) funding rate is neutral/beneficial (< 0.05%/8h absolute). \
-Reject when: a strong liq cluster blocks the path within 2% OR funding rate is extreme (> 0.08%).`;
+const SYSTEM = `You are a binary trade-gatekeeper for a crypto SMC (Smart Money Concepts) strategy.
+Given technical signal data and orderbook context, respond ONLY with a single JSON object on one line:
+{"approved":bool,"confidence":1-10,"reason":"max 15 words"}
+
+CRITICAL DISTINCTION — read carefully:
+- BUY wall  = bid-side liquidity (demand) = price SUPPORT
+- SELL wall = ask-side liquidity (supply) = price RESISTANCE
+
+For LONG entries:
+  SELL wall ABOVE entry = resistance the price must overcome → evaluate size/distance
+  BUY wall at/below entry = support/demand = POSITIVE, NEVER a rejection reason
+  A large buy wall at entry for a LONG = strong institutional demand behind the trade → lean APPROVE
+
+For SHORT entries (mirror logic):
+  BUY wall BELOW entry = support the price must break → evaluate size/distance
+  SELL wall at/above entry = overhead supply = POSITIVE, NEVER a rejection reason
+
+SELL wall rules (for LONG):
+- Notional < $500k → easily swept, not structural → APPROVE
+- Notional > $3M AND within 1% of entry AND TP cannot clear it → REJECT
+- Notional > $3M but TP target is above/clear of the wall → short-squeeze setup → APPROVE
+
+G7 / R:R gate (structural, not contextual):
+- If the signal explicitly states G7=False or RR < 1.5 → REJECT (insufficient reward)
+- RR 1.5–2.0 = marginal, only approve if wall context is clearly supportive
+- RR ≥ 2.0 = meets minimum, evaluate normally
+
+Funding rate:
+- neutral (< 0.05%/8h absolute) or unknown = no veto
+- extreme (> 0.08%/8h) AND against trade direction = REJECT
+
+Default bias: APPROVE unless a HIGH-notional SELL wall (for LONG) or BUY wall (for SHORT)
+structurally blocks the TP path, OR G7=False/RR < 1.5.`;
 
 const direction = (side ?? 'long').toUpperCase();
 const USER = `SMC Signal — ${symbol} ${direction} @ $${entry_price ?? 'n/a'}

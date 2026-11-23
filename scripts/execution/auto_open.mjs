@@ -58,12 +58,15 @@ function getStructuralTp(sym, side, entryPriceUsd, slPct) {
 
 // ─── Score → execution params (from CLAUDE.md leverage table) ────────────────
 
+// leverage derived from execution rules leverage table (SL distance → max leverage):
+// ≤2% → 20x | ≤3% → 15x | ≤4% → 12x | ≤5% → 10x | ≤7% → 7x | ≤10% → 5x | >10% → 3x
+// notional_pct = margin (% of NAV); actual market exposure = margin × leverage
 const SCORE_PARAMS = {
-  10: { sl_pct: 2.0, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
-  9:  { sl_pct: 2.5, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
-  8:  { sl_pct: 3.3, notional_pct: 0.05, take_profit_pct: 18, early_tp_pct: 7, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
-  7:  { sl_pct: 5.0, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
-  6:  { sl_pct: 5.0, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
+  10: { sl_pct: 2.0, leverage: 20, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
+  9:  { sl_pct: 2.5, leverage: 15, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
+  8:  { sl_pct: 3.3, leverage: 12, notional_pct: 0.05, take_profit_pct: 18, early_tp_pct: 7, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
+  7:  { sl_pct: 5.0, leverage:  7, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
+  6:  { sl_pct: 5.0, leverage:  7, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
 };
 
 // ─── CLI parsing ─────────────────────────────────────────────────────────────
@@ -100,6 +103,7 @@ if (!symbol)                                              errors.push('--symbol 
 if (!side || !['long', 'short'].includes(side))           errors.push('--side must be "long" or "short"');
 if (score == null || isNaN(score))                        errors.push('--score is required (integer 6–10)');
 else if (score < 6 || score > 10)                         errors.push('--score must be 6–10 (below 6 = not tradeable)');
+else if (score < 9)                                       errors.push(`--score ${score} too low for auto_open — Score ≥ 9 required (Score 8 = monitoring only, no auto_open)`);
 else if (side === 'long' && score < 8)                    errors.push('--score for LONG must be ≥ 8 (LONG min-score policy — requires K=ja catalyst)');
 if (side === 'long' && sector === 'ai_infrastructure')    errors.push('LONG ai_infrastructure blocked — sector WR 0%, -134 EUR over 5 trades; use SHORT side or wait for sector recovery');
 if (!reason)                                              errors.push('--reason is required');
@@ -149,6 +153,16 @@ function lookupCryptoPrice(sym) {
       if (entry?.mark_price_usd) return { price_usd: entry.mark_price_usd, source: 'indicator_cache' };
     } catch { /* fall through */ }
   }
+  // 3) ohlcv_daily_<SYM>.json — last candle close (covers all SMC symbols)
+  const ohlcvPath = path.join(CACHE_DIR, `ohlcv_daily_${sym.toUpperCase()}.json`);
+  if (fs.existsSync(ohlcvPath)) {
+    try {
+      const candles = JSON.parse(fs.readFileSync(ohlcvPath, 'utf8'));
+      const arr = Array.isArray(candles) ? candles : (candles.ohlcv ?? []);
+      const last = arr[arr.length - 1];
+      if (last?.close) return { price_usd: last.close, source: 'ohlcv_daily_cache' };
+    } catch { /* fall through */ }
+  }
   return null;
 }
 
@@ -176,14 +190,15 @@ const scoreParams              = SCORE_PARAMS[score];
 const stopLossPct              = scoreParams.sl_pct;
 const breakevenTriggerPct      = scoreParams.breakeven_trigger_pct;
 
-// Structural TP: try SMC-based level first, fall back to score-based levels.
-// Structural TP is only used when R:R >= 1.5 (enforced inside structural_tp.py).
-const structTp = getStructuralTp(symbol, side, priceUsd, stopLossPct);
+const isHeatmapEntry = typeof reason === 'string' && reason.startsWith('heatmap_');
+// LONG heatmap entries exit via trailing stop + breakeven (open-ended reward).
+// SHORT entries and SMC entries use a fixed structural TP.
+const isHeatmapLong  = isHeatmapEntry && side === 'long';
 
-// Partial TP: early de-risk (tp1) + full exit (tp2).
-// tp1: structural level OR score-based early de-risk (7% Score-8, 8% Score-9/10)
-// tp2: structural level 2 OR fixed score full TP (18/20%)
-// Always active for Score 8+: closes 50% at tp1, moves SL to BE, lets rest run.
+// Structural TP: skip for heatmap LONG (trailing stop handles exit).
+const structTp = isHeatmapLong ? null : getStructuralTp(symbol, side, priceUsd, stopLossPct);
+
+// Partial TP: active for shorts and SMC entries; heatmap LONG uses trailing stop only.
 let tp1Pct, tp2Pct, tpSource, tp1PriceUsd, tp2PriceUsd, tp1Source, tp2Source;
 if (structTp) {
   tp1Pct      = +structTp.tp_pct.toFixed(2);
@@ -193,7 +208,7 @@ if (structTp) {
   tp2PriceUsd = structTp.tp2_available ? structTp.tp2_price_usd : null;
   tp1Source   = structTp.source;
   tp2Source   = structTp.tp2_available ? structTp.tp2_source : 'fixed_score';
-} else {
+} else if (!isHeatmapLong) {
   tp1Pct      = scoreParams.early_tp_pct;
   tp2Pct      = scoreParams.take_profit_pct;
   tpSource    = 'early_derisk_score';
@@ -201,19 +216,20 @@ if (structTp) {
   tp2PriceUsd = null;
   tp1Source   = 'early_derisk_score';
   tp2Source   = 'fixed_score';
+} else {
+  tpSource    = 'trailing_stop';
 }
-const takeProfitPct  = tp2Pct;  // full-exit level — stored on position for observability
-const hasPartialTp   = true;    // always use partial TP for Score 8+
+const takeProfitPct = isHeatmapLong ? null : tp2Pct;
+const hasPartialTp  = !isHeatmapLong;
 const trailingStopDistancePct = scoreParams.trailing_stop_distance_pct ?? null;
 // Thesis windows by signal type (tStark bypasses; Score 10 = no boundary):
 // heatmap_* → Score 8: 5d | Score 9: 7d
 // smc_detector (reason starts "Score N") → 7d
-// sweep_reversal_4h (LONG) → 4d  (backtest: avg hold 2.3d, optimal max 48b=8d)
+// sweep_reversal_4h (LONG) → 2d  (combined mode: 1H entry, backtest optimal hold=24b=24h, 2d gives room)
 // sweep_reversal_4h_short (SHORT) → 10d (backtest: avg hold 2.6d, optimal max 72b=12d)
 // sweep_reversal_1h → 2d  |  sweep_reversal_1h_short → 3d
 // level_entry → 10d  |  other Score 9 catalyst → 14d
 // Score 8 non-heatmap → 14d  |  tStark → null  |  Score 10 → null
-const isHeatmapEntry         = typeof reason === 'string' && reason.startsWith('heatmap_');
 const isSweepReversal4hShort = typeof reason === 'string' && reason.includes('sweep_reversal_4h_short');
 const isSweepReversal1hShort = typeof reason === 'string' && reason.includes('sweep_reversal_1h_short');
 const isSweepReversal4h      = typeof reason === 'string' && reason.includes('sweep_reversal_4h') && !isSweepReversal4hShort;
@@ -222,12 +238,14 @@ const isSweepReversal        = isSweepReversal4h || isSweepReversal4hShort || is
 const isSmcEntry             = typeof reason === 'string' && /^Score \d/.test(reason) && !isSweepReversal;
 const isLevelEntry           = typeof reason === 'string' && reason.startsWith('level_');
 const _thesisDays = tStark || score >= 10 ? null
-  : score === 9 ? (isHeatmapEntry ? 7 : isSweepReversal4hShort ? 10 : isSweepReversal4h ? 4 : isSweepReversal1hShort ? 3 : isSweepReversal1h ? 2 : isSmcEntry ? 7 : isLevelEntry ? 10 : 14)
-  : /* score 8 */ (isHeatmapEntry ? 5 : isSweepReversal4hShort ? 10 : isSweepReversal4h ? 4 : isSweepReversal1hShort ? 3 : isSweepReversal1h ? 2 : 14);
+  : score === 9 ? (isHeatmapEntry ? 7 : isSweepReversal4hShort ? 10 : isSweepReversal4h ? 2 : isSweepReversal1hShort ? 3 : isSweepReversal1h ? 2 : isSmcEntry ? 7 : isLevelEntry ? 10 : 14)
+  : /* score 8 */ (isHeatmapEntry ? 5 : isSweepReversal4hShort ? 10 : isSweepReversal4h ? 2 : isSweepReversal1hShort ? 3 : isSweepReversal1h ? 2 : 14);
 const thesisValidUntil = _thesisDays != null
   ? new Date(Date.now() + _thesisDays * 24 * 3_600_000).toISOString()
   : null;
-const notionalEur              = notionalOverride ?? +(nav * scoreParams.notional_pct).toFixed(2);
+const leverageMultiplier       = scoreParams.leverage ?? 1;
+const marginEur                = notionalOverride ?? +(nav * scoreParams.notional_pct).toFixed(2);
+const notionalEur              = +(marginEur * leverageMultiplier).toFixed(2);
 
 // sl_not_before: stocks use yesterday's close as mark → cache lags AH/pre-market.
 // Always grant 28h grace for stocks so the SL is evaluated against the real next-day close.
@@ -239,15 +257,16 @@ const slNotBefore = category === 'stock'
 
 const policyErrors = [];
 
-// Gate 1: Max positions
+// Gate 1: Max positions (swing only — ob_scalp positions use a separate 2-slot limit)
 const MAX_POSITIONS = 5;
-if (state.open_positions.length >= MAX_POSITIONS) {
-  policyErrors.push(`max_positions_reached: ${state.open_positions.length}/${MAX_POSITIONS} open — close a position first`);
+const swingPositions = state.open_positions.filter(p => p.strategy !== 'ob_scalp');
+if (swingPositions.length >= MAX_POSITIONS) {
+  policyErrors.push(`max_positions_reached: ${swingPositions.length}/${MAX_POSITIONS} open — close a position first`);
 }
 
-// Gate 2: Cash floor (20% NAV)
+// Gate 2: Cash floor (20% NAV) — deducts margin only (leveraged notional stays as market exposure)
 const CASH_FLOOR_PCT = 0.20;
-const cashAfter = state.cash - notionalEur;
+const cashAfter = state.cash - marginEur;
 if (cashAfter < nav * CASH_FLOOR_PCT) {
   policyErrors.push(
     `cash_floor_violated: cash after open would be ${cashAfter.toFixed(0)} EUR ` +
@@ -284,9 +303,10 @@ if (state.open_positions.some(p => p.symbol === symbol && p.side === side)) {
   policyErrors.push(`position_already_open: ${symbol} ${side}`);
 }
 
-// Gate 5: R/R ≥ 2.0 for heatmap entries (G7-equivalent)
+// Gate 5: R/R ≥ 2.0 for heatmap SHORT entries only (G7-equivalent)
+// LONG heatmap entries skip this gate — trailing stop gives open-ended reward (inherently > 2.0).
 // smc_detector.py enforces G7 internally — only heatmap signals lack this check.
-if (isHeatmapEntry) {
+if (isHeatmapEntry && !isHeatmapLong) {
   if (!structTp) {
     policyErrors.push(`rr_gate_failed: no structural TP found for ${symbol} — cannot verify R/R ≥ 2.0 (G7)`);
   } else if (structTp.rr < 2.0) {
@@ -428,7 +448,8 @@ state.open_positions.push({
   ...(trailingStopDistancePct != null ? { trailing_stop_distance_pct: trailingStopDistancePct } : {}),
   ...(thesisValidUntil != null ? { thesis_valid_until: thesisValidUntil, thesis_status: 'active' } : {}),
   ...(tStark ? { t_stark: true } : {}),
-  leverage:           1,
+  leverage:           leverageMultiplier,
+  margin_eur:         marginEur,
   entry_timestamp:    new Date().toISOString(),
   entry_run_id:       runId,
   strategy:           'auto_open',

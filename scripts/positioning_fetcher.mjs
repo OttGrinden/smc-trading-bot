@@ -36,7 +36,7 @@ const CACHE_PATH      = join(TRADING_DIR, 'cache', 'positioning_data.json');
 const LOGS_DIR        = join(TRADING_DIR, 'logs');
 const BITUNIX_BASE    = 'https://fapi.bitunix.com';
 const DEFAULT_MAX_AGE = 90;   // Minuten
-const ANCHOR_SYMBOLS  = ['BTC', 'ETH'];
+const ANCHOR_SYMBOLS  = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'TAO'];
 
 // ─── Symbol normalization ─────────────────────────────────────────────────────
 

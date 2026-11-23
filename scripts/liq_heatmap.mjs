@@ -26,7 +26,7 @@ const LOGS_DIR     = join(TRADING_DIR, 'logs');
 const BITUNIX_BASE = 'https://fapi.bitunix.com';
 
 // Symbole: immer BTC, ETH + XRP als Standard + aktuelle Crypto-Kandidaten aus letztem Run
-const ANCHOR_SYMBOLS = ['BTC', 'ETH', 'XRP', 'SOL', 'BNB'];
+const ANCHOR_SYMBOLS = ['BTC', 'ETH', 'XRP', 'SOL', 'BNB', 'TAO'];
 const BUCKET_PCT     = 0.5;   // 0.5% Bucket-Breite
 const WALL_FACTOR    = 2.5;   // Wall = Bucket mit ≥2.5x Durchschnittsvolumen
 const NEAR_ZONE_PCT  = 5.0;   // Analyse-Zone ±5% vom aktuellen Preis

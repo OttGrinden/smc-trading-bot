@@ -372,7 +372,7 @@ async function main() {
 
   if (!needsFetch.length && !needsWeekly.length && !needsMonthly.length) {
     process.stderr.write(JSON.stringify({ info: 'ohlcv_fetcher_nothing_to_fetch' }) + '\n');
-    process.exit(0);
+    // no exit — SMC daily/4h/1h/15m sections below still need to run
   }
 
   process.stderr.write(JSON.stringify({

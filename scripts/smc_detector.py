@@ -61,9 +61,9 @@ SWEEP_EMA_PERIOD     = 50   # EMA period on 4H candles for G2 (≈ 8-day moving 
 #
 # G1 for sweep_reversal LONG: pin-bar strength threshold (bullish rejection)
 #   close_pos = (close - low) / (high - low): 1 = closed at high
-#   0.50 → close in top 50% of range.
-#   Backtest: 0.50 maximises expectancy (+0.43%/trade, confluence=True, hold=48b).
-SWEEP_G1_PIN_BAR_THRESHOLD = 0.50
+#   0.70 → close in top 30% of range (stronger bullish rejection required).
+#   Backtest: 0.70 maximises expectancy (+0.417%/trade, pin_bar=0.70, tp_rr=3.0, hold=24b, confluence=True).
+SWEEP_G1_PIN_BAR_THRESHOLD = 0.70
 #
 # G1 for sweep_reversal SHORT: bearish pin-bar threshold
 #   close_pos_bear = (high - close) / (high - low): 1 = closed at low
@@ -124,6 +124,51 @@ def load_ohlcv_1h(symbol: str) -> Optional[list]:
     except Exception:
         pass
     return None
+
+
+def load_ohlcv_15m(symbol: str) -> Optional[list]:
+    path = os.path.join(CACHE_DIR, f'ohlcv_15m_{symbol}.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as fh:
+            candles = json.load(fh)
+        if isinstance(candles, list) and len(candles) >= 10:
+            return candles
+    except Exception:
+        pass
+    return None
+
+
+def synth_live_4h_from_1h(candles_1h: list, candles_4h: list) -> Optional[dict]:
+    """
+    Synthesize the currently forming (not yet closed) 4H candle from recent 1H bars.
+
+    Infers the 4H window duration from consecutive 4H timestamps — works regardless
+    of whether timestamps are in ms or seconds. Returns None if no 1H bars fall
+    within the forming 4H window (i.e. the last closed 4H candle is very recent).
+    """
+    if not candles_1h or not candles_4h or len(candles_4h) < 2:
+        return None
+    last_4h_ts = candles_4h[-1].get('timestamp')
+    prev_4h_ts = candles_4h[-2].get('timestamp')
+    if not (isinstance(last_4h_ts, (int, float)) and isinstance(prev_4h_ts, (int, float))):
+        return None
+    window_dur    = last_4h_ts - prev_4h_ts   # inferred from data (ms or s)
+    next_4h_start = last_4h_ts + window_dur
+    intra = [c for c in candles_1h
+             if isinstance(c.get('timestamp'), (int, float))
+             and c['timestamp'] >= next_4h_start]
+    if not intra:
+        return None
+    return {
+        'timestamp': next_4h_start,
+        'open':    intra[0]['open'],
+        'high':    max(c['high'] for c in intra),
+        'low':     min(c['low']  for c in intra),
+        'close':   intra[-1]['close'],
+        'is_live': True,
+    }
 
 
 # ── State management ───────────────────────────────────────────────────────────
@@ -284,11 +329,21 @@ def check_idm_sweep(candles: list, bos: dict, idm: dict) -> tuple:
 
 def check_idm_sweep_4h(candles_4h: list, bos_timestamp: int,
                         idm_price: float, orig_price: float,
-                        direction: str) -> tuple:
-    """Check 4H candles after BOS timestamp for intraday IDM sweep."""
+                        direction: str,
+                        live_4h_candle: Optional[dict] = None) -> tuple:
+    """Check 4H candles after BOS timestamp for intraday IDM sweep.
+
+    live_4h_candle: synthesized forming 4H candle from 1H data (may not be closed yet).
+    Including it allows the detector to catch IDM sweeps that happen during the
+    forming 4H candle — previously these were invisible until the candle closed (~4h later).
+    """
     post_bos = [c for c in candles_4h
                 if isinstance(c.get('timestamp'), (int, float))
                 and c['timestamp'] > bos_timestamp]
+    if (live_4h_candle
+            and isinstance(live_4h_candle.get('timestamp'), (int, float))
+            and live_4h_candle['timestamp'] > bos_timestamp):
+        post_bos.append(live_4h_candle)
     if not post_bos:
         return False, True
     if direction == 'long':
@@ -425,15 +480,16 @@ def detect_sweep_reversal_4h(
             close_pos    = (cj['close'] - cj['low']) / candle_range if candle_range > 0 else 0.0
             g1           = close_pos >= SWEEP_G1_PIN_BAR_THRESHOLD
 
-            # ── G7: R/R ≥ 1:2 ────────────────────────────────────────────────
+            # ── G7: R/R ≥ 1:3 ────────────────────────────────────────────────
             # SL = 0.2% below sweep wick
             # TP  = highest high in the 50 bars before the sweep (prior distribution)
+            # Backtest: 3.0 threshold maximises expectancy vs 2.0 (+0.417%/trade)
             sl_level  = cj['low'] * 0.998
             sl_dist   = current_price - sl_level
             lb_start  = max(0, j - 50)
             target_price = max(c2['high'] for c2 in candles_4h[lb_start : j]) if j > 0 else current_price
             rr = (target_price - current_price) / sl_dist if sl_dist > 0 else 0.0
-            g7 = rr >= 2.0
+            g7 = rr >= 3.0
 
             score = (
                 (2 if g1 else 0) +
@@ -445,9 +501,15 @@ def detect_sweep_reversal_4h(
                 (1 if g7 else 0)
             )
 
+            # G2 required for auto_open threshold: counter-trend (below EMA50) → cap at 8
+            if not g2 and score >= 9:
+                score = 8
+
             if score < 8:
                 continue   # below monitoring threshold — skip
 
+            is_live_sweep = cj.get('is_live', False)
+            live_suffix   = ' [live 4H forming candle]' if is_live_sweep else ''
             return {
                 'symbol':           symbol,
                 'score':            score,
@@ -462,6 +524,7 @@ def detect_sweep_reversal_4h(
                 'sl_level':         round(sl_level, 4),
                 'rr':               round(rr, 2),
                 'bars_since_sweep': bars_ago,
+                'is_live_4h_sweep': is_live_sweep,
                 'g1_bos_4h':        g1,
                 'g2_ema50_4h':      g2,
                 'g3_sweep':         True,
@@ -473,7 +536,7 @@ def detect_sweep_reversal_4h(
                 'reason':           (
                     f'Score {score} (sweep_reversal_4h): '
                     f'4H sweep of daily pivot {sl_price:.4f} → long | '
-                    f'G1={g1} G2={g2} G4={g4} G6={g6} G7={g7} RR={rr:.1f}'
+                    f'G1={g1} G2={g2} G4={g4} G6={g6} G7={g7} RR={rr:.1f}{live_suffix}'
                 ),
             }
 
@@ -553,7 +616,7 @@ def detect_sweep_reversal_1h(
             close_pos    = (cj['close'] - cj['low']) / candle_range if candle_range > 0 else 0.0
             g1           = close_pos >= SWEEP_G1_PIN_BAR_THRESHOLD
 
-            # ── G7: R/R ≥ 1:2 using 24-bar lookback high ─────────────────────
+            # ── G7: R/R ≥ 1:3 using 24-bar lookback high ─────────────────────
             sl_level  = cj['low'] * 0.998
             sl_dist   = current_price - sl_level
             lb_start  = max(0, j - SWEEP_1H_G7_LOOKBACK)
@@ -693,9 +756,15 @@ def detect_sweep_reversal_4h_short(
                 (1 if g7 else 0)
             )
 
+            # G2 required for auto_open threshold: counter-trend (above EMA50) → cap at 8
+            if not g2 and score >= 9:
+                score = 8
+
             if score < 8:
                 continue
 
+            is_live_sweep = cj.get('is_live', False)
+            live_suffix   = ' [live 4H forming candle]' if is_live_sweep else ''
             return {
                 'symbol':           symbol,
                 'score':            score,
@@ -710,6 +779,7 @@ def detect_sweep_reversal_4h_short(
                 'sl_level':         round(sl_level, 4),
                 'rr':               round(rr, 2),
                 'bars_since_sweep': bars_ago,
+                'is_live_4h_sweep': is_live_sweep,
                 'g1_bos_4h':        g1,
                 'g2_ema50_4h':      g2,
                 'g3_sweep':         True,
@@ -721,7 +791,7 @@ def detect_sweep_reversal_4h_short(
                 'reason':           (
                     f'Score {score} (sweep_reversal_4h_short): '
                     f'4H sweep of daily pivot {sh_price:.4f} → short | '
-                    f'G1={g1} G2={g2} G4={g4} G6={g6} G7={g7} RR={rr:.1f}'
+                    f'G1={g1} G2={g2} G4={g4} G6={g6} G7={g7} RR={rr:.1f}{live_suffix}'
                 ),
             }
 
@@ -959,36 +1029,55 @@ def main() -> None:
             candles    = load_ohlcv(symbol)
             candles_4h = load_ohlcv_4h(symbol)
             candles_1h = load_ohlcv_1h(symbol)
+            candles_15m = load_ohlcv_15m(symbol)
             price_4h   = candles_4h[-1]['close'] if candles_4h else None
+
+            # Synthesize the currently forming 4H candle from 1H data.
+            # This fills the gap: a sweep that occurs during the forming 4H candle
+            # (e.g. 06:30 UTC on the 04:00-08:00 candle) would otherwise be invisible
+            # until the candle closes up to 4 hours later.
+            live_4h       = synth_live_4h_from_1h(candles_1h, candles_4h) if (candles_1h and candles_4h) else None
+            candles_4h_ext = candles_4h + [live_4h] if live_4h else candles_4h
+
             out        = detect_setup(candles, symbol, price_4h)
             pivot_highs, pivot_lows = find_pivots(candles)   # daily pivots for sweep detectors
 
             # 4H intraday IDM sweep — only for Score-8 (IDM not yet swept on daily)
             if out['score'] == 8 and candles_4h and out.get('bos_timestamp'):
-                swept_4h, intact_4h = check_idm_sweep_4h(
+                # Check closed 4H candles only (baseline)
+                swept_closed, _ = check_idm_sweep_4h(
                     candles_4h, out['bos_timestamp'],
                     out['idm_level'], out['origin_level'], out['side'],
                 )
+                # Check again including the forming 4H candle (live_4h)
+                swept_4h, intact_4h = check_idm_sweep_4h(
+                    candles_4h, out['bos_timestamp'],
+                    out['idm_level'], out['origin_level'], out['side'],
+                    live_4h_candle=live_4h,
+                )
                 if swept_4h and intact_4h:
-                    out['idm_swept'] = True
-                    out['score']     = 9
-                    out['reason']    = 'Score 9 (4H): IDM swept on 4H candle + origin intact'
+                    out['idm_swept']      = True
+                    out['score']          = 9
+                    live_triggered        = live_4h is not None and not swept_closed
+                    out['is_live_4h_sweep'] = live_triggered
+                    suffix = ' [live 4H forming candle — not yet closed]' if live_triggered else ''
+                    out['reason'] = f'Score 9 (4H): IDM swept on 4H candle + origin intact{suffix}'
                     if out['ote_low'] is not None and price_4h is not None:
                         if out['ote_low'] <= price_4h <= out['ote_high']:
                             out['score']  = 10
-                            out['reason'] = 'Score 10 (4H): IDM swept on 4H + in OTE'
+                            out['reason'] = f'Score 10 (4H): IDM swept on 4H + in OTE{suffix}'
 
             # ── Sweep-reversal path: additional 4H signal (independent of daily BOS) ──
             # Uses daily pivot lows as reference levels so macro lows (months old)
             # are captured. Outputs a SECOND line for the symbol when found.
             #
-            # Confluence confirmation: backtest shows requiring the next 4H bar to
-            # close bullish (before entering) adds ~+0.43%/trade expectancy.
-            # Implementation: first scan stores pending; second scan with same level
-            # + bullish confirmation 4H bar → confirmed → original score returned.
-            if candles_4h:
+            # candles_4h_ext includes the forming 4H candle (from 1H) so a sweep that
+            # occurs intracandle (before the 4H bar closes) is detected immediately.
+            # The pending_confirmation mechanism already handles the live-candle case:
+            # a bullish 1H close after the sweep timestamp confirms the signal.
+            if candles_4h_ext:
                 sweep = detect_sweep_reversal_4h(
-                    candles_4h,
+                    candles_4h_ext,
                     pivot_lows,
                     out.get('ema200') or 0.0,
                     symbol,
@@ -1008,12 +1097,35 @@ def main() -> None:
                         ref_level = pending_sweep.get('sweep_level', 0)
                         same_lvl  = ref_level > 0 and abs(ref_level - sweep['sweep_level']) / ref_level < 0.005
                         if same_lvl:
-                            sig_ts   = pending_sweep.get('signal_4h_ts', 0)
-                            conf_bar = next(
-                                (c for c in candles_4h if c['timestamp'] > sig_ts), None
+                            sig_ts = pending_sweep.get('signal_4h_ts', 0)
+                            # Combined mode: first 1H bullish close after the 4H sweep signal.
+                            # Faster than waiting for a full 4H bar to close (~1-4h vs ~4h).
+                            # Backtest: combined 4H+1H mode with 24b hold = best expectancy (+45.5%).
+                            conf_bars = candles_1h if candles_1h else candles_4h
+                            conf_bar  = next(
+                                (c for c in conf_bars if c['timestamp'] > sig_ts and c['close'] > c['open']),
+                                None,
                             )
-                            if conf_bar is not None and conf_bar['close'] > conf_bar['open']:
+                            if conf_bar is not None:
                                 confluence_confirmed = True
+                            elif candles_15m:
+                                # 15m early warning: fires before 1H close — monitoring only, NOT an execution trigger.
+                                bar_15m = next(
+                                    (c for c in candles_15m if c['timestamp'] > sig_ts and c['close'] > c['open']),
+                                    None,
+                                )
+                                if bar_15m is not None:
+                                    import sys as _sys
+                                    print(json.dumps({
+                                        'info':        'smc_15m_early_warning',
+                                        'symbol':      symbol,
+                                        'side':        'long',
+                                        'score':       pending_sweep['score'],
+                                        'sweep_level': pending_sweep['sweep_level'],
+                                        'bar_15m_ts':  bar_15m['timestamp'],
+                                        'bar_15m_close': bar_15m['close'],
+                                        'note':        '15m bullish close seen — 1H confirmation still pending',
+                                    }), file=_sys.stderr)
 
                     sweep['confluence_confirmed'] = confluence_confirmed
 
@@ -1038,7 +1150,7 @@ def main() -> None:
                         })
                         # Downgrade score: 9 → 8 (monitoring), 8 → 7 (suppressed)
                         sweep['score']  = max(0, sweep['score'] - 1)
-                        sweep['reason'] = sweep['reason'] + ' [waiting confluence: next 4H bar must close bullish]'
+                        sweep['reason'] = sweep['reason'] + ' [waiting confluence: next 1H bar must close bullish]'
 
                     outputs.append(sweep)
                     state_changes += 1
@@ -1113,9 +1225,9 @@ def main() -> None:
                         state_changes += 1
 
             # ── Sweep-reversal SHORT path: 4H bearish sweep ───────────────────
-            if candles_4h:
+            if candles_4h_ext:
                 sweep_short = detect_sweep_reversal_4h_short(
-                    candles_4h,
+                    candles_4h_ext,
                     pivot_highs,
                     out.get('ema200') or 0.0,
                     symbol,
@@ -1134,13 +1246,32 @@ def main() -> None:
                         ref_level = pending_sweep_short.get('sweep_level', 0)
                         same_lvl  = ref_level > 0 and abs(ref_level - sweep_short['sweep_level']) / ref_level < 0.005
                         if same_lvl:
-                            sig_ts   = pending_sweep_short.get('signal_4h_ts', 0)
-                            conf_bar = next(
-                                (c for c in candles_4h if c['timestamp'] > sig_ts), None
+                            sig_ts    = pending_sweep_short.get('signal_4h_ts', 0)
+                            # Combined mode: first 1H bearish close after the 4H sweep signal.
+                            conf_bars = candles_1h if candles_1h else candles_4h
+                            conf_bar  = next(
+                                (c for c in conf_bars if c['timestamp'] > sig_ts and c['close'] < c['open']),
+                                None,
                             )
-                            # Bearish confirmation: next 4H bar must close bearish
-                            if conf_bar is not None and conf_bar['close'] < conf_bar['open']:
+                            if conf_bar is not None:
                                 confluence_confirmed_short = True
+                            elif candles_15m:
+                                bar_15m_s = next(
+                                    (c for c in candles_15m if c['timestamp'] > sig_ts and c['close'] < c['open']),
+                                    None,
+                                )
+                                if bar_15m_s is not None:
+                                    import sys as _sys
+                                    print(json.dumps({
+                                        'info':          'smc_15m_early_warning',
+                                        'symbol':        symbol,
+                                        'side':          'short',
+                                        'score':         pending_sweep_short['score'],
+                                        'sweep_level':   pending_sweep_short['sweep_level'],
+                                        'bar_15m_ts':    bar_15m_s['timestamp'],
+                                        'bar_15m_close': bar_15m_s['close'],
+                                        'note':          '15m bearish close seen — 1H confirmation still pending',
+                                    }), file=_sys.stderr)
 
                     sweep_short['confluence_confirmed'] = confluence_confirmed_short
 
@@ -1162,7 +1293,7 @@ def main() -> None:
                             'status':             'pending_confirmation',
                         })
                         sweep_short['score']  = max(0, sweep_short['score'] - 1)
-                        sweep_short['reason'] = sweep_short['reason'] + ' [waiting confluence: next 4H bar must close bearish]'
+                        sweep_short['reason'] = sweep_short['reason'] + ' [waiting confluence: next 1H bar must close bearish]'
 
                     outputs.append(sweep_short)
                     state_changes += 1

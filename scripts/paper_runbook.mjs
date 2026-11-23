@@ -139,7 +139,36 @@ if (RUN_SCAN) {
   }
   const scanPath = path.join(cwd, 'scripts', 'smc_scan.mjs');
   console.log(`\nRunning scan: node ${scanPath}`);
-  const result = spawnSync(process.execPath, [scanPath], { stdio: 'inherit' });
+
+  // Slim output filter — suppress noisy but non-actionable lines
+  const SUPPRESS_INFO = new Set([
+    'scan_step_start', 'scan_step_done',
+    'ohlcv_fetcher_nothing_to_fetch',
+    'positioning_fetched', 'positioning_done',
+    'liq_heatmap_cached', 'liq_heatmap_done',
+    'level_armed_waiting', 'level_entry_summary',
+    'smc_state_summary', 'smc_monitoring',
+    'macro_regime_read', 'thesis_expiry_done',
+    'scalp_skip_rr',
+    'liq_heatmap_start',
+    'position_held_outside_candidates',
+    'position_held_direction_watch',
+  ]);
+  const result = spawnSync(process.execPath, [scanPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const scanLines = [
+    ...(result.stdout?.toString('utf8') ?? '').split('\n'),
+    ...(result.stderr?.toString('utf8') ?? '').split('\n'),
+  ];
+  for (const line of scanLines) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const o = JSON.parse(t);
+      if (o.gate_fail !== undefined) continue;
+      if (o.info && SUPPRESS_INFO.has(o.info)) continue;
+    } catch {}
+    process.stdout.write(t + '\n');
+  }
 
   // --- Mark-to-market: update open positions with current heatmap prices ---
   try {
@@ -174,12 +203,12 @@ if (RUN_SCAN) {
           // Recompute portfolio-level unrealized PnL, gross_exposure and NAV
           const totalUnrealized = state.open_positions
             .reduce((s, p) => s + (p.unrealized_pnl_eur ?? 0), 0);
-          const totalNotional = state.open_positions
-            .reduce((s, p) => s + (p.notional_eur ?? 0), 0);
+          const totalCommitted = state.open_positions
+            .reduce((s, p) => s + (p.margin_eur != null ? p.margin_eur : (p.notional_eur ?? 0)), 0);
           state.unrealized_pnl  = +totalUnrealized.toFixed(4);
-          state.gross_exposure  = +(totalNotional + totalUnrealized).toFixed(4);
+          state.gross_exposure  = +(totalCommitted + totalUnrealized).toFixed(4);
           state.net_exposure    = state.gross_exposure;
-          state.equity_nav      = +(state.cash + totalNotional + totalUnrealized).toFixed(4);
+          state.equity_nav      = +(state.cash + totalCommitted + totalUnrealized).toFixed(4);
           state.last_updated_at = now;
           fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
           process.stderr.write(JSON.stringify({
@@ -225,7 +254,14 @@ if (RUN_SCAN) {
         fs.writeFileSync(runLogPath,   JSON.stringify(slRunLog));
         fs.writeFileSync(emptyDecPath, JSON.stringify([]));
         const enginePath = path.join(cwd, 'scripts', 'execution', 'portfolio', 'portfolio_engine.mjs');
-        spawnSync(process.execPath, [enginePath, '--run-log', runLogPath, '--decisions', emptyDecPath, '--post-sl-block-hours', '0'], { stdio: 'inherit' });
+        const engResult = spawnSync(process.execPath, [enginePath, '--run-log', runLogPath, '--decisions', emptyDecPath, '--post-sl-block-hours', '0'], { stdio: ['ignore', 'ignore', 'pipe'] });
+        const ENG_SUPPRESS = new Set(['position_held_outside_candidates', 'position_held_direction_watch']);
+        for (const line of (engResult.stderr?.toString('utf8') ?? '').split('\n')) {
+          const t = line.trim();
+          if (!t) continue;
+          try { const o = JSON.parse(t); if (o.info && ENG_SUPPRESS.has(o.info)) continue; } catch {}
+          process.stderr.write(t + '\n');
+        }
         try { fs.unlinkSync(runLogPath); } catch {}
       }
     }

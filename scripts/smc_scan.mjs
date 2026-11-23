@@ -11,9 +11,11 @@
  *   5. smc_detector.py        → SMC-Signale (nur wenn GREEN)
  *   5b. level_conflict_filter → Level-Signale mit gegensätzlichem SMC-Signal supprimieren
  *   5c. level_dispatch        → Bereinigte Level-Signale dispatchen
- *   6. SMC Dispatch           → Score 8: Monitoring-Log; Score 9+: thesis_reviewer → auto_open
- *   7. macro_trader.mjs       → BTC/ETH Macro-Signale (fail-soft)
- *   8. thesis_expiry_check.mjs → SMC-Positionen expiry (fail-soft)
+ *   6. SMC Dispatch           → Score 8: Monitoring; Score 9+: thesis_reviewer → auto_open
+ *   7. [DISABLED]             → macro_trader deaktiviert
+ *   8. thesis_expiry_check.mjs → Positionen expiry (fail-soft)
+ *   9. smc_scalp_detector.py  → OB-Scalp: 1m pin bar in 4H IDM sweep zone (fail-soft, GREEN only)
+ *  10. [DISABLED]             → heatmap_trader deaktiviert
  */
 
 import { readFileSync } from 'fs';
@@ -337,84 +339,162 @@ for (const signal of smc8only) {
   );
 }
 
-for (const signal of smc9plus) {
-  const reviewerPath = join(SCRIPTS_DIR, 'thesis_reviewer.mjs');
-  const autoOpenPath = join(SCRIPTS_DIR, 'execution', 'auto_open.mjs');
+// Score 9+ → thesis_reviewer → auto_open
+{
+  const smcAutoOpenPath = join(SCRIPTS_DIR, 'execution', 'auto_open.mjs');
+  const smcReviewerPath = join(SCRIPTS_DIR, 'thesis_reviewer.mjs');
 
-  process.stderr.write(JSON.stringify({ info: 'smc_thesis_review_start', symbol: signal.symbol, score: signal.score, side: signal.side }) + '\n');
+  for (const signal of smc9plus) {
+    process.stderr.write(JSON.stringify({
+      info:   'smc_thesis_review_start',
+      symbol: signal.symbol,
+      score:  signal.score,
+      side:   signal.side,
+      reason: signal.reason,
+    }) + '\n');
 
-  await discordNotify(
-    `🎯 **SMC Score ${signal.score} Signal** — ${signal.symbol} ${signal.side.toUpperCase()}\n` +
-    `Entry: $${signal.entry_price ?? signal.current_price} | ${signal.reason}\n` +
-    `OTE: $${signal.ote_low ?? '?'} – $${signal.ote_high ?? '?'} | thesis_reviewer läuft...`
-  );
+    await discordNotify(
+      `🎯 **SMC Score ${signal.score}** — ${signal.symbol} ${signal.side.toUpperCase()}\n` +
+      `IDM: $${signal.idm_level ?? '?'} | Preis: $${signal.current_price ?? '?'} · thesis_reviewer läuft...`
+    );
 
-  const rv = spawnSync(process.execPath, [reviewerPath, '--signal', JSON.stringify(signal)], {
-    timeout: 90_000, maxBuffer: 1 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'],
-  });
+    const rv = spawnSync(process.execPath, [
+      smcReviewerPath, '--signal', JSON.stringify(signal),
+    ], { timeout: 90_000, maxBuffer: 1 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] });
 
-  let review = { approved: false, confidence: 1, reason: 'reviewer_failed', symbol: signal.symbol, score: signal.score };
-  if (!rv.error && rv.status === 0) {
-    try { review = JSON.parse(rv.stdout?.toString('utf8').trim() ?? '{}'); } catch { /* keep default */ }
-  } else {
-    process.stderr.write(JSON.stringify({ warn: 'smc_reviewer_spawn_failed', symbol: signal.symbol, detail: rv.error?.message ?? `exit ${rv.status}` }) + '\n');
-  }
+    let review = { approved: false, confidence: 1, reason: 'reviewer_failed', symbol: signal.symbol, score: signal.score };
+    if (!rv.error && rv.status === 0) {
+      try { review = JSON.parse(rv.stdout?.toString('utf8').trim() ?? '{}'); } catch { /* keep default */ }
+    } else {
+      process.stderr.write(JSON.stringify({
+        warn:   'smc_reviewer_spawn_failed',
+        symbol: signal.symbol,
+        detail: rv.error?.message ?? `exit ${rv.status}`,
+      }) + '\n');
+    }
 
-  process.stderr.write(JSON.stringify({
-    info:            'smc_thesis_review_result',
-    symbol:          signal.symbol,
-    approved:        review.approved,
-    confidence:      review.confidence,
-    reason:          review.reason,
-    reviewer_calls:  review.reviewer_calls  ?? null,
-    input_tokens:    review.input_tokens    ?? null,
-    output_tokens:   review.output_tokens   ?? null,
-  }) + '\n');
+    process.stderr.write(JSON.stringify({
+      info:       'smc_thesis_review_result',
+      symbol:     signal.symbol,
+      approved:   review.approved,
+      confidence: review.confidence,
+      reason:     review.reason,
+    }) + '\n');
 
-  if (!review.approved) {
-    process.stderr.write(JSON.stringify({ warn: 'smc_auto_open_blocked', symbol: signal.symbol, reason: review.reason }) + '\n');
-    await discordNotify(`⛔ **${signal.symbol} BLOCKED** (Score ${signal.score}) — ${review.reason}`);
-    continue;
-  }
+    if (!review.approved) {
+      process.stderr.write(JSON.stringify({
+        warn: 'smc_auto_open_blocked', symbol: signal.symbol, reason: review.reason,
+      }) + '\n');
+      await discordNotify(`⛔ **${signal.symbol} SMC BLOCKED** (Score ${signal.score}) — ${review.reason}`);
+      continue;
+    }
 
-  await discordNotify(
-    `✅ **TRADE APPROVED** — ${signal.symbol} ${signal.side.toUpperCase()} Score ${signal.score}\n` +
-    `Confidence: ${review.confidence}/10 | ${review.reason}\n` +
-    `→ auto_open wird ausgeführt...`
-  );
+    await discordNotify(
+      `✅ **SMC APPROVED** — ${signal.symbol} ${signal.side.toUpperCase()} Score ${signal.score}\n` +
+      `Confidence: ${review.confidence}/10 | ${review.reason}`
+    );
 
-  const ao = spawnSync(process.execPath, [
-    autoOpenPath,
-    '--symbol',   signal.symbol,
-    '--side',     signal.side,
-    '--score',    String(signal.score),
-    '--reason',   signal.reason,
-    '--category', 'crypto',
-    '--bypass-direction-flip-ceiling8',
-  ], {
-    timeout: 60_000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'],
-  });
+    const ao = spawnSync(process.execPath, [
+      smcAutoOpenPath,
+      '--symbol',   signal.symbol,
+      '--side',     signal.side,
+      '--score',    String(signal.score),
+      '--reason',   signal.reason,
+      '--category', 'crypto',
+    ], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] });
 
-  if (ao.error || ao.status !== 0) {
-    process.stderr.write(JSON.stringify({ warn: 'smc_auto_open_failed', symbol: signal.symbol, detail: ao.error?.message ?? `exit ${ao.status}` }) + '\n');
-  } else {
-    try {
-      const aoOut = JSON.parse(ao.stdout?.toString('utf8') ?? '{}');
-      process.stderr.write(JSON.stringify({ info: 'smc_auto_open_result', symbol: signal.symbol, ...aoOut }) + '\n');
-    } catch {
-      process.stderr.write(JSON.stringify({ info: 'smc_auto_open_done', symbol: signal.symbol }) + '\n');
+    if (ao.error || ao.status !== 0) {
+      process.stderr.write(JSON.stringify({
+        warn:   'smc_auto_open_failed',
+        symbol: signal.symbol,
+        detail: ao.error?.message ?? `exit ${ao.status}`,
+      }) + '\n');
+    } else {
+      try {
+        const aoOut = JSON.parse(ao.stdout?.toString('utf8') ?? '{}');
+        process.stderr.write(JSON.stringify({
+          info: 'smc_auto_open_result', symbol: signal.symbol, ...aoOut,
+        }) + '\n');
+      } catch {
+        process.stderr.write(JSON.stringify({
+          info: 'smc_auto_open_done', symbol: signal.symbol,
+        }) + '\n');
+      }
     }
   }
 }
 
-// 7. Macro Trader — BTC/ETH Macro (fail-soft)
-softStep('macro_trader.mjs', 'macro_trader');
+// 7. Macro Trader — DISABLED (scalp_only_mode)
+// softStep('macro_trader.mjs', 'macro_trader');
 
 // 8. Thesis Expiry — bestehende SMC-Positionen prüfen (fail-soft)
 softStep('thesis_expiry_check.mjs', 'thesis_expiry');
 
-// 9. Heatmap Trader — auto-execution from liq_heatmap signals (fail-soft)
-softStep('heatmap_trader.mjs', 'heatmap_trader');
+// 9. OB-Scalp Detector — 1m pin bar in 4H IDM sweep zone (fail-soft, only when GREEN)
+if (smcGreen) {
+  const scalp_raw = softPyStep('smc_scalp_detector.py', 'scalp_detector');
+  if (scalp_raw) {
+    const scalp_lines   = scalp_raw.trim().split('\n').filter(Boolean);
+    const scalp_signals = scalp_lines
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(s => s !== null && s.strategy === 'ob_scalp' && s.symbol);
+
+    process.stderr.write(JSON.stringify({
+      info:    'scalp_detector_result',
+      signals: scalp_signals.length,
+      symbols: scalp_signals.map(s => `${s.symbol}(tp${s.tp_pct}%,sl${s.sl_dist_pct}%)`),
+    }) + '\n');
+
+    const scalp_open_path = join(SCRIPTS_DIR, 'execution', 'scalp_open.mjs');
+
+    for (const sig of scalp_signals) {
+      process.stderr.write(JSON.stringify({
+        info:    'scalp_open_attempt',
+        symbol:  sig.symbol, score: sig.score,
+        tp_pct:  sig.tp_pct, sl_pct: sig.sl_dist_pct,
+        pin_ts:  sig.pin_bar_ts, reason: sig.reason,
+      }) + '\n');
+
+      await discordNotify(
+        `⚡ **OB-Scalp Signal** — ${sig.symbol} LONG Score ${sig.score}\n` +
+        `TP: +${sig.tp_pct}% | SL: -${sig.sl_dist_pct.toFixed(3)}% | Pin: ${sig.pin_bar_ts}\n` +
+        `Zone: $${sig.sl_level} → $${sig.ob_top} | scalp_open läuft...`
+      );
+
+      const ao = spawnSync(process.execPath, [
+        scalp_open_path,
+        '--symbol', sig.symbol,
+        '--score',  String(sig.score),
+        '--sl-pct', String(sig.sl_dist_pct),
+        '--tp-pct', String(sig.tp_pct),
+        '--reason', sig.reason,
+      ], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] });
+
+      if (ao.error || ao.status !== 0) {
+        process.stderr.write(JSON.stringify({
+          warn:   'scalp_open_failed', symbol: sig.symbol,
+          detail: ao.error?.message ?? `exit ${ao.status}`,
+        }) + '\n');
+      } else {
+        try {
+          const aoOut = JSON.parse(ao.stdout?.toString('utf8') ?? '{}');
+          process.stderr.write(JSON.stringify({ info: 'scalp_open_result', symbol: sig.symbol, ...aoOut }) + '\n');
+          await discordNotify(
+            `✅ **OB-Scalp OPENED** — ${sig.symbol} LONG Score ${sig.score}\n` +
+            `Entry: $${aoOut.price_usd} | TP: $${aoOut.tp_level_usd} (+${sig.tp_pct}%) | ` +
+            `SL: $${aoOut.sl_level_usd} (-${sig.sl_dist_pct.toFixed(3)}%)\n` +
+            `Max-Hold: 2h | Notional: ${aoOut.notional_eur} EUR | Slots: ${aoOut.portfolio?.scalp_positions}/2`
+          );
+        } catch {
+          process.stderr.write(JSON.stringify({ info: 'scalp_open_done', symbol: sig.symbol }) + '\n');
+        }
+      }
+    }
+  }
+}
+
+// 10. Heatmap Trader — DISABLED (scalp_only_mode)
+// softStep('heatmap_trader.mjs', 'heatmap_trader');
 
 // Discord: Scan-Summary
 await discordNotify(
