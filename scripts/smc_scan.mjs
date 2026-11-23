@@ -358,8 +358,9 @@ for (const signal of smc8only) {
       `IDM: $${signal.idm_level ?? '?'} | Preis: $${signal.current_price ?? '?'} · thesis_reviewer läuft...`
     );
 
+    const reviewerSignal = { ...signal, entry_price: signal.current_price };
     const rv = spawnSync(process.execPath, [
-      smcReviewerPath, '--signal', JSON.stringify(signal),
+      smcReviewerPath, '--signal', JSON.stringify(reviewerSignal),
     ], { timeout: 90_000, maxBuffer: 1 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] });
 
     let review = { approved: false, confidence: 1, reason: 'reviewer_failed', symbol: signal.symbol, score: signal.score };
