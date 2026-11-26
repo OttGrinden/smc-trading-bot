@@ -40,11 +40,11 @@ const CLOSE_SCRIPT   = join(__dirname, 'execution/manual_close.mjs');
 const LOGS_DIR       = join(TRADING_DIR, 'logs');
 
 // Thresholds
-const STAGNANT_THRESHOLD        = 4;   // |pnl_pct| < 4% for thesis-expiry trigger
-const STAGNATION_DAYS           = 21;  // days open before stagnation check fires (stocks / Score 10)
-const STAGNATION_PCT            = 3;   // |pnl_pct| < 3% = stagnant
-const STAGNATION_DAYS_CRYPTO    = 14;  // faster stagnation for crypto (no thesis window → Score 10 only)
-const STAGNATION_PCT_CRYPTO     = 2;   // tighter pct threshold for crypto
+const STAGNANT_THRESHOLD        = 3;   // |pnl_pct| < 3% for thesis-expiry trigger (war 4%)
+const STAGNATION_DAYS           = 10;  // days open before stagnation check fires (war 21d)
+const STAGNATION_PCT            = 2;   // |pnl_pct| < 2% = stagnant (war 3%)
+const STAGNATION_DAYS_CRYPTO    = 7;   // faster stagnation for crypto (war 14d)
+const STAGNATION_PCT_CRYPTO     = 1.5; // tighter pct threshold for crypto (war 2%)
 const RSI_SHORT_EXHAUSTION = 40;  // SHORT: close when RSI drops below this (momentum exhausted)
 const RSI_LONG_EXHAUSTION  = 70;  // LONG:  close when RSI rises above this (momentum exhausted)
 const RSI_MIN_DAYS_OPEN    = 2;   // don't fire RSI exhaustion before 2 days open

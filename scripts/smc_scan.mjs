@@ -107,11 +107,13 @@ if (levelRaw) {
 
 // 4. SMC Regime Filter
 let smcGreen = false;
+let fngValue  = null;
 const regimeRaw = softPyStep('regime_filter.py', 'regime_filter');
 if (regimeRaw) {
   try {
     const regime = JSON.parse(regimeRaw.trim());
     smcGreen = regime.regime === 'GREEN';
+    fngValue  = regime.fng_value ?? null;
     process.stderr.write(JSON.stringify({
       info:      'regime_filter_result',
       regime:    regime.regime,
@@ -320,8 +322,22 @@ const macroAlignedLevelSignals = cleanLevelSignals.filter(sig => {
 }
 
 // 6. SMC Dispatch
+// FNG ≤ 40 (Fear oder schlechter) → LONG-Signale blockieren; SHORT-Signale passieren
+const FNG_LONG_MIN = 40;
 const smc8only = smcSignals.filter(s => s.score === 8);
-const smc9plus = smcSignals.filter(s => s.score >= 9);
+const smc9plus = smcSignals.filter(s => s.score >= 9).filter(sig => {
+  if (sig.side === 'long' && fngValue !== null && fngValue <= FNG_LONG_MIN) {
+    process.stderr.write(JSON.stringify({
+      warn:      'smc_long_suppressed_fng',
+      symbol:    sig.symbol,
+      fng_value: fngValue,
+      threshold: FNG_LONG_MIN,
+      note:      `LONG suppressed — FNG ${fngValue} ≤ ${FNG_LONG_MIN} (Fear/Extreme Fear)`,
+    }) + '\n');
+    return false;
+  }
+  return true;
+});
 
 for (const signal of smc8only) {
   process.stderr.write(JSON.stringify({

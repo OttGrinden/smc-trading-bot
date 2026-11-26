@@ -63,7 +63,7 @@ function getStructuralTp(sym, side, entryPriceUsd, slPct) {
 // notional_pct = margin (% of NAV); actual market exposure = margin × leverage
 const SCORE_PARAMS = {
   10: { sl_pct: 2.0, leverage: 20, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
-  9:  { sl_pct: 2.5, leverage: 15, notional_pct: 0.05, take_profit_pct: 20, early_tp_pct: 8, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
+  9:  { sl_pct: 1.5, leverage: 20, notional_pct: 0.05, take_profit_pct: 8,  early_tp_pct: 3, breakeven_trigger_pct: 3, trailing_stop_distance_pct: 2 },
   8:  { sl_pct: 3.3, leverage: 12, notional_pct: 0.05, take_profit_pct: 18, early_tp_pct: 7, breakeven_trigger_pct: 8, trailing_stop_distance_pct: 5 },
   7:  { sl_pct: 5.0, leverage:  7, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
   6:  { sl_pct: 5.0, leverage:  7, notional_pct: 0.03, take_profit_pct: null, early_tp_pct: null, breakeven_trigger_pct: null },
